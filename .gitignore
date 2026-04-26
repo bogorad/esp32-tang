@@ -55,3 +55,12 @@ managed_components/
 # Cryptographic files
 *.jwk
 *.jwe
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+esphome/
+.codex/
+.direnv/

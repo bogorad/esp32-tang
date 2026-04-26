@@ -76,6 +76,7 @@ void handleActivate() {
 
     uint8_t shared_secret[32];
     if (!compute_ecdh_shared_secret(eph_pub_key, admin_private_key, shared_secret)) {
+        tang::secure_zero(shared_secret, sizeof(shared_secret));
         server_http.send(500, "text/plain", "Activation ECDH failed");
         return;
     }
@@ -99,33 +100,52 @@ void handleActivate() {
     uint8_t password_buf[65] = {0}; // Max password length + null terminator
     int decoded_len = base64_url_decode(ciphertext_b64, password_buf, sizeof(password_buf));
     if (decoded_len < 0) {
+        tang::secure_zero(password_buf, sizeof(password_buf));
+        tang::secure_zero(cek, sizeof(cek));
+        tang::secure_zero(shared_secret, sizeof(shared_secret));
         server_http.send(400, "text/plain", "Bad Request: Invalid ciphertext encoding");
         return;
     }
 
     if (!jwe_gcm_decrypt(password_buf, decoded_len, cek, sizeof(cek), iv_buf, sizeof(iv_buf), tag_buf, sizeof(tag_buf), (const uint8_t*)protected_header_b64, strlen(protected_header_b64))) {
+        tang::secure_zero(password_buf, sizeof(password_buf));
+        tang::secure_zero(cek, sizeof(cek));
+        tang::secure_zero(shared_secret, sizeof(shared_secret));
         server_http.send(401, "text/plain", "JWE decryption failed: invalid message or tag");
         return;
     }
 
     // 4. Use decrypted password to decrypt the locally stored Tang key
     char* password_str = (char*)password_buf;
-    DEBUG_PRINTF("Decrypted activation password: %s\n", password_str);
 
     uint8_t encrypted_tang_key[32];
     uint8_t gcm_tag[GCM_TAG_SIZE];
+    uint8_t gcm_iv[GCM_IV_SIZE];
     for(int i=0; i<32; ++i) encrypted_tang_key[i] = EEPROM.read(EEPROM_TANG_KEY_ADDR + i);
     for(int i=0; i<GCM_TAG_SIZE; ++i) gcm_tag[i] = EEPROM.read(EEPROM_TANG_TAG_ADDR + i);
+    if (EEPROM.read(EEPROM_TANG_VERSION_ADDR) == TANG_KEY_RECORD_VERSION) {
+        for(int i=0; i<GCM_IV_SIZE; ++i) gcm_iv[i] = EEPROM.read(EEPROM_TANG_IV_ADDR + i);
+    } else {
+        memset(gcm_iv, 0, sizeof(gcm_iv));
+    }
 
-    if (crypt_local_data_gcm(encrypted_tang_key, 32, password_str, false, gcm_tag)) {
+    if (crypt_local_data_gcm(encrypted_tang_key, 32, password_str, false, gcm_tag, gcm_iv)) {
         memcpy(tang_private_key, encrypted_tang_key, 32);
         compute_ec_public_key(tang_private_key, tang_public_key);
         is_active = true;
         activation_timestamp = millis();
         DEBUG_PRINTLN("Server ACTIVATED.");
+        tang::secure_zero(encrypted_tang_key, sizeof(encrypted_tang_key));
+        tang::secure_zero(password_buf, sizeof(password_buf));
+        tang::secure_zero(cek, sizeof(cek));
+        tang::secure_zero(shared_secret, sizeof(shared_secret));
         server_http.send(200, "text/plain", "Server activated successfully");
     } else {
         DEBUG_PRINTLN("GCM tag check failed for local key! Invalid password.");
+        tang::secure_zero(encrypted_tang_key, sizeof(encrypted_tang_key));
+        tang::secure_zero(password_buf, sizeof(password_buf));
+        tang::secure_zero(cek, sizeof(cek));
+        tang::secure_zero(shared_secret, sizeof(shared_secret));
         server_http.send(401, "text/plain", "Activation failed: invalid password for stored key");
     }
 }
@@ -153,6 +173,7 @@ void handleDeactivate() {
 
         uint8_t shared_secret[32];
         if (!compute_ecdh_shared_secret(eph_pub_key, admin_private_key, shared_secret)) {
+            tang::secure_zero(shared_secret, sizeof(shared_secret));
             server_http.send(500, "text/plain", "Deactivation ECDH failed");
             return;
         }
@@ -169,29 +190,48 @@ void handleDeactivate() {
         uint8_t password_buf[65] = {0};
         int decoded_len = base64_url_decode(reqDoc["ciphertext"].as<String>(), password_buf, sizeof(password_buf));
         if (decoded_len < 0) {
+            tang::secure_zero(password_buf, sizeof(password_buf));
+            tang::secure_zero(cek, sizeof(cek));
+            tang::secure_zero(shared_secret, sizeof(shared_secret));
             server_http.send(400, "text/plain", "Bad Request: Invalid ciphertext encoding");
             return;
         }
 
         if (!jwe_gcm_decrypt(password_buf, decoded_len, cek, sizeof(cek), iv_buf, sizeof(iv_buf), tag_buf, sizeof(tag_buf), (const uint8_t*)protected_header_b64, strlen(protected_header_b64))) {
+            tang::secure_zero(password_buf, sizeof(password_buf));
+            tang::secure_zero(cek, sizeof(cek));
+            tang::secure_zero(shared_secret, sizeof(shared_secret));
             server_http.send(401, "text/plain", "JWE decryption failed for new password");
             return;
         }
 
         char* new_password_str = (char*)password_buf;
-        DEBUG_PRINTF("Received new password for saving: %s\n", new_password_str);
 
         uint8_t key_to_save[32];
         uint8_t new_gcm_tag[GCM_TAG_SIZE];
+        uint8_t new_gcm_iv[GCM_IV_SIZE];
         memcpy(key_to_save, tang_private_key, 32);
-        crypt_local_data_gcm(key_to_save, 32, new_password_str, true, new_gcm_tag);
+        if (!crypt_local_data_gcm(key_to_save, 32, new_password_str, true, new_gcm_tag, new_gcm_iv)) {
+            tang::secure_zero(key_to_save, sizeof(key_to_save));
+            tang::secure_zero(password_buf, sizeof(password_buf));
+            tang::secure_zero(cek, sizeof(cek));
+            tang::secure_zero(shared_secret, sizeof(shared_secret));
+            server_http.send(500, "text/plain", "Failed to encrypt Tang key");
+            return;
+        }
 
         for(int i=0; i<32; ++i) EEPROM.write(EEPROM_TANG_KEY_ADDR + i, key_to_save[i]);
         for(int i=0; i<GCM_TAG_SIZE; ++i) EEPROM.write(EEPROM_TANG_TAG_ADDR + i, new_gcm_tag[i]);
+        for(int i=0; i<GCM_IV_SIZE; ++i) EEPROM.write(EEPROM_TANG_IV_ADDR + i, new_gcm_iv[i]);
+        EEPROM.write(EEPROM_TANG_VERSION_ADDR, TANG_KEY_RECORD_VERSION);
         EEPROM.commit();
 
         DEBUG_PRINTLN("New encrypted Tang key saved to EEPROM.");
         deactivate_server();
+        tang::secure_zero(key_to_save, sizeof(key_to_save));
+        tang::secure_zero(password_buf, sizeof(password_buf));
+        tang::secure_zero(cek, sizeof(cek));
+        tang::secure_zero(shared_secret, sizeof(shared_secret));
         server_http.send(200, "text/plain", "Key saved and server deactivated");
     }
 }

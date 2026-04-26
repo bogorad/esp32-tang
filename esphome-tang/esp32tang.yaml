@@ -1,0 +1,98 @@
+---
+substitutions:
+  device_name: esp32-tang
+  friendly_name: ESP32 Tang
+  tang_source: github://bogorad/esp32-tang@main
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: m5stack-atom
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: "12345678"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+external_components:
+  - source: ${tang_source}
+    components: [tang_server]
+    refresh: always
+
+tang_server:
+  id: tang_component
+  initial_password: !secret tang_initial_password
+  key_lifetime: 1h
+  on_request:
+    then:
+      - homeassistant.event:
+          event: esphome.tang_request
+          data:
+            path: !lambda "return path;"
+            method: !lambda "return method;"
+            status: !lambda "return status;"
+  on_activate:
+    then:
+      - homeassistant.event:
+          event: esphome.tang_activate
+          data:
+            success: !lambda "return success;"
+  on_deactivate:
+    then:
+      - homeassistant.event:
+          event: esphome.tang_deactivate
+  on_recovery:
+    then:
+      - homeassistant.event:
+          event: esphome.tang_recovery
+          data:
+            success: !lambda "return success;"
+
+binary_sensor:
+  - platform: tang_server
+    tang_server_id: tang_component
+    active:
+      name: "Tang Active"
+
+sensor:
+  - platform: tang_server
+    tang_server_id: tang_component
+    request_count:
+      name: "Tang Request Count"
+    activation_count:
+      name: "Tang Activation Count"
+    recovery_count:
+      name: "Tang Recovery Count"
+    last_status:
+      name: "Tang Last Status"
+
+text_sensor:
+  - platform: tang_server
+    tang_server_id: tang_component
+    last_path:
+      name: "Tang Last Path"
+    last_method:
+      name: "Tang Last Method"
+    last_error:
+      name: "Tang Last Error"

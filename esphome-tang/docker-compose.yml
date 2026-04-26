@@ -1,0 +1,16 @@
+services:
+  esphome:
+    image: ghcr.io/esphome/esphome:stable
+    working_dir: /work
+    volumes:
+      - ..:/work:ro
+      - esphome-cache:/cache
+    environment:
+      PLATFORMIO_CORE_DIR: /cache/platformio
+    entrypoint:
+      - bash
+    command:
+      - /work/esphome-tang/esphome-compile.sh
+
+volumes:
+  esphome-cache:

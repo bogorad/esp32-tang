@@ -7,12 +7,11 @@
  */
 #include <Arduino.h>
 
-// The main header file for the Tang Server application logic.
-// This contains the setup() and loop() functions.
-#include "TangServer.h"
+#include "arduino_app.h"
 
 // Define the task handle for the Arduino loop
 TaskHandle_t arduinoTaskHandle = NULL;
+TangStandaloneApp app;
 
 #if !CONFIG_AUTOSTART_ARDUINO
 /**
@@ -21,11 +20,11 @@ TaskHandle_t arduinoTaskHandle = NULL;
  */
 void arduinoTask(void *pvParameters) {
     // Call the Arduino setup function
-    setup();
+    app.setup();
 
     // Run the Arduino loop function indefinitely
     for (;;) {
-        loop();
+        app.loop();
         // Yield to other tasks
         vTaskDelay(1 / portTICK_PERIOD_MS);
     }

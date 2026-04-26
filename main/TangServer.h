@@ -54,7 +54,11 @@ const int EEPROM_ADMIN_KEY_ADDR = 4;
 const int EEPROM_TANG_KEY_ADDR = EEPROM_ADMIN_KEY_ADDR + 32;
 const int GCM_TAG_SIZE = 16;
 const int EEPROM_TANG_TAG_ADDR = EEPROM_TANG_KEY_ADDR + 32;
-const int EEPROM_WIFI_SSID_ADDR = EEPROM_TANG_TAG_ADDR + GCM_TAG_SIZE;
+const int GCM_IV_SIZE = 12;
+const int EEPROM_TANG_IV_ADDR = EEPROM_TANG_TAG_ADDR + GCM_TAG_SIZE;
+const int EEPROM_TANG_VERSION_ADDR = EEPROM_TANG_IV_ADDR + GCM_IV_SIZE;
+const uint8_t TANG_KEY_RECORD_VERSION = 1;
+const int EEPROM_WIFI_SSID_ADDR = EEPROM_TANG_VERSION_ADDR + 1;
 const int EEPROM_WIFI_PASS_ADDR = EEPROM_WIFI_SSID_ADDR + 33;
 const uint32_t EEPROM_MAGIC_VALUE = 0xCAFEDEAD;
 
@@ -100,10 +104,16 @@ void setup() {
         generate_ec_keypair(tang_public_key, tang_private_key);
         uint8_t encrypted_tang_key[32];
         uint8_t gcm_tag[GCM_TAG_SIZE];
+        uint8_t gcm_iv[GCM_IV_SIZE];
         memcpy(encrypted_tang_key, tang_private_key, 32);
-        crypt_local_data_gcm(encrypted_tang_key, 32, initial_tang_password, true, gcm_tag);
+        if (!crypt_local_data_gcm(encrypted_tang_key, 32, initial_tang_password, true, gcm_tag, gcm_iv)) {
+            DEBUG_PRINTLN("ERROR: Failed to encrypt initial Tang key!");
+            return;
+        }
         for (int i = 0; i < 32; ++i) EEPROM.write(EEPROM_TANG_KEY_ADDR + i, encrypted_tang_key[i]);
         for (int i = 0; i < GCM_TAG_SIZE; ++i) EEPROM.write(EEPROM_TANG_TAG_ADDR + i, gcm_tag[i]);
+        for (int i = 0; i < GCM_IV_SIZE; ++i) EEPROM.write(EEPROM_TANG_IV_ADDR + i, gcm_iv[i]);
+        EEPROM.write(EEPROM_TANG_VERSION_ADDR, TANG_KEY_RECORD_VERSION);
 
         // 3. Write magic number and commit
         EEPROM.put(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
