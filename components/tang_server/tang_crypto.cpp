@@ -11,12 +11,14 @@
 #include <mbedtls/ecdsa.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/gcm.h>
+#include <mbedtls/sha1.h>
 #include <mbedtls/sha256.h>
 
 namespace tang {
 namespace {
 
 constexpr char kRngPersonalization[] = "esp32_tang_server";
+constexpr size_t kSha1DigestSize = 20;
 
 void write_be32(uint8_t *buf, uint32_t val) {
   buf[0] = (val >> 24) & 0xFF;
@@ -413,7 +415,7 @@ bool compute_ec_jwk_thumbprint(const uint8_t pub_key[kEcPublicKeySize],
   char y[48];
   size_t x_len = 0;
   size_t y_len = 0;
-  uint8_t digest[kSha256DigestSize];
+  uint8_t digest[kSha1DigestSize];
   bool ok = base64_url_encode(pub_key, kEcPrivateKeySize, x, sizeof(x),
                               &x_len) &&
             base64_url_encode(pub_key + kEcPrivateKeySize, kEcPrivateKeySize, y,
@@ -422,8 +424,11 @@ bool compute_ec_jwk_thumbprint(const uint8_t pub_key[kEcPublicKeySize],
     const std::string canonical = "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"" +
                                   std::string(x, x_len) + "\",\"y\":\"" +
                                   std::string(y, y_len) + "\"}";
-    ok = sha256_digest(reinterpret_cast<const uint8_t *>(canonical.data()),
-                       canonical.size(), digest);
+    // Tang and Clevis use JOSE's default SHA-1 JWK thumbprint as the recovery
+    // URL key identifier. This digest identifies the key; it is not used for
+    // signatures, key derivation, or encryption.
+    ok = mbedtls_sha1(reinterpret_cast<const uint8_t *>(canonical.data()),
+                      canonical.size(), digest) == 0;
   }
   if (ok) {
     ok = base64_url_encode(digest, sizeof(digest), output, output_size,

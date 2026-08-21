@@ -1,5 +1,7 @@
 #include "tang_server.h"
 
+#include <algorithm>
+
 #include "tang_http_handler.h"
 
 #ifdef USE_BINARY_SENSOR
@@ -16,7 +18,12 @@ namespace esphome {
 namespace tang_server {
 
 void TangServerComponent::setup() {
-  web_server_base::global_web_server_base->add_handler(new TangHttpHandler(this));
+  this->handler_ = new TangHttpHandler(this);
+  // CoreContext has consumed the one-time initialization password. Reduce its
+  // lifetime in the component object instead of retaining it for the process.
+  std::fill(this->initial_password_.begin(), this->initial_password_.end(), '\0');
+  this->initial_password_.clear();
+  web_server_base::global_web_server_base->add_handler(this->handler_);
 #ifdef USE_BINARY_SENSOR
   if (this->active_binary_sensor_ != nullptr) {
     this->active_binary_sensor_->publish_state(false);
@@ -35,13 +42,19 @@ void TangServerComponent::setup() {
 #endif
 }
 
-void TangServerComponent::loop() {}
+void TangServerComponent::loop() {
+  if (this->handler_ != nullptr) {
+    this->handler_->loop();
+  }
+}
 
 void TangServerComponent::set_initial_password(const std::string &value) { this->initial_password_ = value; }
 
 void TangServerComponent::set_key_lifetime(uint32_t ms) { this->key_lifetime_ = ms; }
 
 void TangServerComponent::set_notify_requests(bool value) { this->notify_requests_ = value; }
+
+void TangServerComponent::set_reset_storage(bool value) { this->reset_storage_ = value; }
 
 void TangServerComponent::set_active_binary_sensor(binary_sensor::BinarySensor *sensor) {
   this->active_binary_sensor_ = sensor;
@@ -64,6 +77,10 @@ void TangServerComponent::set_last_method_text_sensor(text_sensor::TextSensor *s
 void TangServerComponent::set_last_error_text_sensor(text_sensor::TextSensor *sensor) { this->last_error_text_sensor_ = sensor; }
 
 const std::string &TangServerComponent::initial_password() const { return this->initial_password_; }
+
+uint32_t TangServerComponent::key_lifetime() const { return this->key_lifetime_; }
+
+bool TangServerComponent::reset_storage() const { return this->reset_storage_; }
 
 void TangServerComponent::fire_request(const std::string &path, const std::string &method, int status) {
   this->request_count_++;

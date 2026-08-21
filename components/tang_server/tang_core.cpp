@@ -479,20 +479,29 @@ TangServerCore::TangServerCore(TangStorage *storage, TangClock *clock,
       logger_(logger),
       initialized_(false),
       active_(false),
+      key_lifetime_ms_(kDefaultKeyLifetimeMs),
       activation_timestamp_(0),
       tang_private_key_{0},
       tang_public_key_{0},
       admin_private_key_{0},
       admin_public_key_{0} {}
 
+void TangServerCore::set_key_lifetime(uint32_t key_lifetime_ms) {
+  key_lifetime_ms_ = key_lifetime_ms;
+}
+
 bool TangServerCore::setup(const char *initial_password) {
-  if (storage_ == nullptr || clock_ == nullptr || initial_password == nullptr) {
+  if (storage_ == nullptr || clock_ == nullptr) {
     return false;
   }
 
   if (storage_->is_initialized()) {
     initialized_ = load_admin_key();
     return initialized_;
+  }
+
+  if (initial_password == nullptr || initial_password[0] == '\0') {
+    return false;
   }
 
   initialized_ = initialize_storage(initial_password);
@@ -504,7 +513,8 @@ void TangServerCore::loop() {
     return;
   }
 
-  if (clock_->millis() - activation_timestamp_ > kDefaultKeyLifetimeMs) {
+  // Unsigned subtraction also remains correct when the monotonic clock wraps.
+  if (clock_->millis() - activation_timestamp_ >= key_lifetime_ms_) {
     if (logger_ != nullptr) {
       logger_->debug("Key lifetime expired. Deactivating server automatically.");
     }

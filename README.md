@@ -13,12 +13,12 @@ and ESPHome glue lives in `components/tang_server/`.
 
 This implementation is still experimental. It supports ESPHome compilation,
 standalone compilation, Tang advertisement/admin endpoints, activation and
-deactivation flow plumbing, ESPHome automations, and optional ESPHome status
-entities.
+deactivation flow plumbing, ESPHome automations, optional ESPHome status
+entities, and persistent ESPHome Tang state across OTA updates and power loss.
 
-Runtime curl validation still requires a real ESP32 on the network. Protocol
-compatibility work has advanced, but live Clevis interoperability remains a
-separate validation step.
+The ESPHome adapter has been validated on ESP32 hardware with activation,
+automatic key expiry, restart persistence, and a live Clevis encrypt/decrypt
+round trip.
 
 ## Standalone Build
 
@@ -66,6 +66,27 @@ tang_server:
   initial_password: !secret tang_initial_password
   key_lifetime: 1h
 ```
+
+`initial_password` is required for the first initialization. After the
+encrypted Tang record and admin key have been stored in ESPHome preferences,
+the password can be removed from subsequent firmware builds. The component
+clears its runtime copy after setup.
+
+To deliberately discard the stored identity, build once with both the original
+initialization password and `reset_storage: true`. Remove `reset_storage` from
+the next build; leaving it enabled creates a new Tang identity on every boot.
+
+```yaml
+tang_server:
+  id: tang_component
+  initial_password: !secret tang_initial_password
+  reset_storage: true
+```
+
+ESPHome preferences are persistent storage, not encrypted storage. The admin
+private key can be recovered by an attacker who can extract unencrypted ESP32
+flash. Enable the platform's flash/NVS encryption when that physical threat is
+in scope.
 
 Required ESPHome secrets for the included example:
 
@@ -138,8 +159,6 @@ Optional ESPHome entities are also available for status dashboards:
 
 This is not yet a finished security product.
 
-- Live ESP32 curl smoke tests still need hardware and an activation JWE.
-- Live Clevis bind/recover tests still need a reachable ESP32.
 - Signed advertisement work currently needs a maintained key model decision for
   admin-key reuse versus a dedicated signing key.
 - Tang key rotation is tracked separately.

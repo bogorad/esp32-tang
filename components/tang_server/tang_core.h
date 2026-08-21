@@ -15,6 +15,7 @@ class TangServerCore {
 
   TangServerCore(TangStorage *storage, TangClock *clock, TangLogger *logger);
 
+  void set_key_lifetime(uint32_t key_lifetime_ms);
   bool setup(const char *initial_password);
   void loop();
   TangResponse handle_request(const TangRequest &request);
@@ -38,6 +39,7 @@ class TangServerCore {
   tang::TangRngContext rng_;
   bool initialized_;
   bool active_;
+  uint32_t key_lifetime_ms_;
   uint32_t activation_timestamp_;
   uint8_t tang_private_key_[tang::kEcPrivateKeySize];
   uint8_t tang_public_key_[tang::kEcPublicKeySize];
