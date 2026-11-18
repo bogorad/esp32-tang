@@ -188,3 +188,21 @@ TEST(e2e_rotation_old_jwe_still_decrypts_with_old_seeds) {
     CHECK(status != 0);
   }
 }
+
+// Clevis builds "$url/adv/$thp" and "$url/rec/$kid" by string concatenation, so
+// a base URL with a trailing slash (or several) yields "//adv/..." paths.
+TEST(e2e_clevis_url_with_trailing_slashes) {
+  REQUIRE(tt::have_tool("clevis"));
+  Shim shim(tt::seed_a(), {});
+  REQUIRE(shim.ok());
+  for (const char *suffix : {"/", "//", "///"}) {
+    int status = -1;
+    const std::string jwe =
+        clevis_encrypt("{\"url\":\"" + shim.url() + suffix + "\"}", "slash\n", &status);
+    CHECK_EQ(status, 0);
+    CHECK(!jwe.empty());
+    status = -1;
+    CHECK_EQ(clevis_decrypt(jwe, &status), std::string("slash\n"));
+    CHECK_EQ(status, 0);
+  }
+}

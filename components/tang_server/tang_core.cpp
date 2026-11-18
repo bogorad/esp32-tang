@@ -841,7 +841,11 @@ bool TangServerCore::loop() {
   return false;
 }
 
-TangResponse TangServerCore::handle_request(const TangRequest &request) {
+TangResponse TangServerCore::handle_request(const TangRequest &raw_request) {
+  // Normalize once, before routing, so every adapter gets the same behavior.
+  TangRequest request = raw_request;
+  request.path = normalize_tang_path(raw_request.path);
+
   bool unattended;
   bool ready;
   {
@@ -905,7 +909,8 @@ bool TangServerCore::is_unattended() const {
 
 TangResponse TangServerCore::handle_adv(const std::string &path) {
   std::string thp;
-  if (path != "/adv" && path != "/adv/") {
+  // `path` is normalized: "/adv" or "/adv/<thp>".
+  if (path != "/adv") {
     thp = path.substr(5);
     if (!is_thumbprint_text(thp)) {
       return text_response(404, "Not found");
@@ -1112,7 +1117,8 @@ TangResponse TangServerCore::handle_deactivate(const TangRequest &request) {
 }
 
 TangResponse TangServerCore::handle_recovery(const TangRequest &request) {
-  if (request.path == "/rec" || request.path == "/rec/") {
+  // `request.path` is normalized: "/rec" or "/rec/<kid>".
+  if (request.path == "/rec") {
     return fail_json(400, "missing_kid", "Recovery requires /rec/{kid}");
   }
 

@@ -611,3 +611,64 @@ TEST(missing_record_with_stored_token_is_an_error_not_a_reinit) {
   CHECK(!log.error_lines.empty());
   CHECK_EQ(core.handle_request(tt::make_request("GET", "/pub")).status, 503);
 }
+
+// ------------------------------------------------------------ path normalizer
+
+TEST(normalize_tang_path_cases) {
+  const std::string thp = "gufGivW1KaP_REkAUWcAJOTopy-V2t6JxcJhUZtvdc0";
+  struct Case {
+    std::string in, want;
+  };
+  const Case cases[] = {
+      {"/adv", "/adv"},
+      {"/adv/", "/adv"},
+      {"//adv", "/adv"},
+      {"//adv/", "/adv"},
+      {"///adv//", "/adv"},
+      {"/adv/" + thp, "/adv/" + thp},
+      {"//adv/" + thp, "/adv/" + thp},
+      {"/adv//" + thp + "/", "/adv/" + thp},
+      {"//rec/" + thp, "/rec/" + thp},
+      {"/rec/" + thp + "/", "/rec/" + thp},
+      {"/", "/"},
+      {"//", "/"},
+      {"/pub/", "/pub"},
+      {"//activate", "/activate"},
+      {"/adv?x=1", "/adv"},
+      {"//adv/?x=//1", "/adv"},
+      {"/adv/" + thp + "?a=b#frag", "/adv/" + thp},
+      {"/adv#frag", "/adv"},
+      {"", ""},
+      {"adv", "adv"},
+  };
+  for (const Case &c : cases) {
+    CHECK_EQ(normalize_tang_path(c.in), c.want);
+    CHECK_EQ(normalize_tang_path(normalize_tang_path(c.in)), c.want);  // idempotent
+  }
+}
+
+TEST(core_routes_clevis_style_paths_like_plain_paths) {
+  Env e;
+  REQUIRE(e.core.setup(unattended_config(tt::seed_a())));
+  const std::string thp = "gufGivW1KaP_REkAUWcAJOTopy-V2t6JxcJhUZtvdc0";
+  for (const char *path : {"/adv", "/adv/", "//adv", "//adv/", "///adv//", "/adv?x=1"}) {
+    CHECK_EQ(e.core.handle_request(tt::make_request("GET", path)).status, 200);
+  }
+  // Unknown thumbprint stays 404; junk thumbprint stays 404; extra segment 404.
+  for (const std::string &path : std::vector<std::string>{
+        "//adv/AAAA", "/adv//AAAA/", "/adv/a$b", "/adv/" + thp + "/x", "//nope/", "/", "//"}) {
+    CHECK_EQ(e.core.handle_request(tt::make_request("GET", path)).status, 404);
+  }
+  // /rec: empty kid is still 400, bad kid 400, unknown kid 404 (never 404 for the route itself).
+  for (const char *path : {"/rec", "/rec/", "//rec/", "//rec//"}) {
+    CHECK_EQ(e.core.handle_request(tt::make_request("POST", path, "x")).status, 400);
+  }
+  CHECK_EQ(e.core.handle_request(tt::make_request("POST", "//rec/a$b/", "x")).status, 400);
+  CHECK_EQ(e.core.handle_request(tt::make_request("POST", "//rec/AAAA/", "x")).status, 404);
+  // Unattended mode: password endpoints stay 404 in every slash form.
+  for (const char *path : {"/pub", "/pub/", "//pub/", "///pub", "//activate", "/activate/",
+                           "//deactivate//", "/pub?x=1"}) {
+    CHECK_EQ(e.core.handle_request(tt::make_request("GET", path)).status, 404);
+    CHECK_EQ(e.core.handle_request(tt::make_request("POST", path, "x")).status, 404);
+  }
+}

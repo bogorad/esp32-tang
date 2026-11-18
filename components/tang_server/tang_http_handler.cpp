@@ -163,7 +163,7 @@ std::string request_path(AsyncWebServerRequest *request) {
 #else
   const auto &url = request->url();
 #endif
-  return to_std_string(url);
+  return normalize_tang_path(to_std_string(url));
 }
 
 bool is_tang_path(const std::string &path) {
