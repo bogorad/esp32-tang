@@ -28,6 +28,9 @@ help:
 	@echo "  monitor         Open serial monitor"
 	@echo "  flash-monitor   Flash and immediately monitor"
 	@echo ""
+	@echo "Test:"
+	@echo "  test            Run host-side tests (tests/run.sh)"
+	@echo ""
 	@echo "Development:"
 	@echo "  size            Show binary size analysis"
 	@echo "  erase           Erase flash completely"
@@ -181,3 +184,9 @@ full-setup: setup-target menuconfig build
 	@echo "  make flash      # Flash to device"
 	@echo "  make monitor    # View serial output"
 	@echo "  make dev        # Flash and monitor"
+
+# Host-side tests (shared core against host mbedTLS, jose and clevis).
+# Runs inside `nix shell` automatically when tools are missing.
+.PHONY: test
+test:
+	tests/run.sh

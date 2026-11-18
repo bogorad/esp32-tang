@@ -11,6 +11,7 @@
 #include <mbedtls/ecdsa.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/gcm.h>
+#include <mbedtls/sha1.h>
 #include <mbedtls/sha256.h>
 
 namespace tang {
@@ -403,8 +404,8 @@ bool compute_ec_point_multiply(TangRngContext *rng,
 }
 
 bool compute_ec_jwk_thumbprint(const uint8_t pub_key[kEcPublicKeySize],
-                               char *output, size_t output_size,
-                               size_t *output_len) {
+                               ThumbprintHash hash, char *output,
+                               size_t output_size, size_t *output_len) {
   if (pub_key == nullptr || output == nullptr || output_size == 0) {
     return false;
   }
@@ -414,19 +415,29 @@ bool compute_ec_jwk_thumbprint(const uint8_t pub_key[kEcPublicKeySize],
   size_t x_len = 0;
   size_t y_len = 0;
   uint8_t digest[kSha256DigestSize];
+  size_t digest_len = 0;
   bool ok = base64_url_encode(pub_key, kEcPrivateKeySize, x, sizeof(x),
                               &x_len) &&
             base64_url_encode(pub_key + kEcPrivateKeySize, kEcPrivateKeySize, y,
                               sizeof(y), &y_len);
   if (ok) {
+    // RFC 7638 canonical form: required members only, sorted, no spaces.
     const std::string canonical = "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"" +
                                   std::string(x, x_len) + "\",\"y\":\"" +
                                   std::string(y, y_len) + "\"}";
-    ok = sha256_digest(reinterpret_cast<const uint8_t *>(canonical.data()),
-                       canonical.size(), digest);
+    const uint8_t *data = reinterpret_cast<const uint8_t *>(canonical.data());
+    if (hash == ThumbprintHash::kSha1) {
+      // SHA-1 is used only as a key identifier (tangd accepts it). It is not
+      // used for signatures or key derivation.
+      digest_len = kSha1DigestSize;
+      ok = mbedtls_sha1(data, canonical.size(), digest) == 0;
+    } else {
+      digest_len = kSha256DigestSize;
+      ok = sha256_digest(data, canonical.size(), digest);
+    }
   }
   if (ok) {
-    ok = base64_url_encode(digest, sizeof(digest), output, output_size,
+    ok = base64_url_encode(digest, digest_len, output, output_size,
                            output_len);
   }
 

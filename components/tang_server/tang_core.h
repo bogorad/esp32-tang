@@ -22,7 +22,7 @@ class TangServerCore {
   bool is_active() const;
 
  private:
-  TangResponse handle_adv();
+  TangResponse handle_adv(const std::string &path);
   TangResponse handle_pub();
   TangResponse handle_activate(const TangRequest &request);
   TangResponse handle_deactivate(const TangRequest &request);

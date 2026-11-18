@@ -15,6 +15,10 @@ constexpr size_t kGcmIvSize = 12;
 constexpr size_t kGcmTagSize = 16;
 constexpr size_t kSha256DigestSize = 32;
 
+constexpr size_t kSha1DigestSize = 20;
+
+enum class ThumbprintHash { kSha1, kSha256 };
+
 using TangRandomFunc = int (*)(void *ctx, unsigned char *output, size_t len);
 
 struct TangRngContext {
@@ -54,9 +58,11 @@ bool compute_ec_point_multiply(TangRngContext *rng,
                                const uint8_t peer_pub_key[kEcPublicKeySize],
                                const uint8_t priv_key[kEcPrivateKeySize],
                                uint8_t output_pub_key[kEcPublicKeySize]);
+// RFC 7638 JWK thumbprint, base64url without padding. Clevis 17+ uses SHA-256
+// for the JWE "kid"; older clients and tangd's own tools also use SHA-1.
 bool compute_ec_jwk_thumbprint(const uint8_t pub_key[kEcPublicKeySize],
-                                char *output, size_t output_size,
-                                size_t *output_len);
+                               ThumbprintHash hash, char *output,
+                               size_t output_size, size_t *output_len);
 bool sign_es256(TangRngContext *rng, const uint8_t priv_key[kEcPrivateKeySize],
                 const uint8_t *data, size_t data_len,
                 uint8_t signature[kEcPublicKeySize]);

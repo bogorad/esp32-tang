@@ -324,16 +324,27 @@ bool base64_url_encode_string(const std::string &data, std::string *out) {
 }
 
 bool compute_key_id(const uint8_t public_key[tang::kEcPublicKeySize],
-                    std::string *kid) {
+                    tang::ThumbprintHash hash, std::string *kid) {
   char encoded[48];
   size_t encoded_len = 0;
-  if (!tang::compute_ec_jwk_thumbprint(public_key, encoded, sizeof(encoded),
-                                       &encoded_len)) {
+  if (!tang::compute_ec_jwk_thumbprint(public_key, hash, encoded,
+                                       sizeof(encoded), &encoded_len)) {
     return false;
   }
 
   kid->assign(encoded, encoded_len);
   return true;
+}
+
+// True when `kid` is the SHA-256 or SHA-1 RFC 7638 thumbprint of the key.
+// Clevis 17+ sends SHA-256; tangd also accepts SHA-1.
+bool kid_matches(const uint8_t public_key[tang::kEcPublicKeySize],
+                 const std::string &kid) {
+  std::string candidate;
+  return (compute_key_id(public_key, tang::ThumbprintHash::kSha256,
+                         &candidate) && candidate == kid) ||
+         (compute_key_id(public_key, tang::ThumbprintHash::kSha1,
+                         &candidate) && candidate == kid);
 }
 
 bool public_jwk(const uint8_t public_key[tang::kEcPublicKeySize],
@@ -347,7 +358,8 @@ bool public_jwk(const uint8_t public_key[tang::kEcPublicKeySize],
     return false;
   }
 
-  if (include_kid && !compute_key_id(public_key, &kid)) {
+  if (include_kid &&
+      !compute_key_id(public_key, tang::ThumbprintHash::kSha256, &kid)) {
     return false;
   }
 
@@ -517,7 +529,7 @@ TangResponse TangServerCore::handle_request(const TangRequest &request) {
     if (request.method != "GET") {
       return text_response(405, "Method Not Allowed");
     }
-    return handle_adv();
+    return handle_adv(request.path);
   }
 
   if (request.path == "/pub") {
@@ -557,9 +569,18 @@ TangResponse TangServerCore::handle_request(const TangRequest &request) {
 
 bool TangServerCore::is_active() const { return active_; }
 
-TangResponse TangServerCore::handle_adv() {
+TangResponse TangServerCore::handle_adv(const std::string &path) {
   if (!active_) {
     return text_response(403, "Server not active");
+  }
+
+  // /adv/<thp>: tangd signs with the key whose SHA-1 or SHA-256 thumbprint is
+  // <thp>. Here only the current signing key is available.
+  if (path.size() > 5) {
+    const std::string thp = path.substr(5);
+    if (!kid_matches(admin_public_key_, thp)) {
+      return text_response(404, "Unknown signing key thumbprint");
+    }
   }
 
   if (logger_ != nullptr) {
@@ -691,14 +712,7 @@ TangResponse TangServerCore::handle_recovery(const TangRequest &request) {
                          "\"message\":\"Recovery key id is invalid\"}");
   }
 
-  std::string active_kid;
-  if (!compute_key_id(tang_public_key_, &active_kid)) {
-    return json_response(500,
-                         "{\"error\":\"kid_unavailable\","
-                         "\"message\":\"Failed to compute active key id\"}");
-  }
-
-  if (kid != active_kid) {
+  if (!kid_matches(tang_public_key_, kid)) {
     return json_response(404,
                          "{\"error\":\"unknown_kid\","
                          "\"message\":\"Recovery key id is not active\"}");

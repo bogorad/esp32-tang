@@ -64,3 +64,6 @@ managed_components/
 esphome/
 .codex/
 .direnv/
+
+# Host tests
+build-tests/
