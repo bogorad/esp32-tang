@@ -44,8 +44,6 @@ void TangArduinoHttpServer::register_routes() {
              [this]() { handle_current_request(); });
   server_.on("/activate", HTTP_POST,
              [this]() { handle_current_request(); });
-  server_.on("/deactivate", HTTP_GET,
-             [this]() { handle_current_request(); });
   server_.on("/deactivate", HTTP_POST,
              [this]() { handle_current_request(); });
   server_.on("/reboot", HTTP_GET, [this]() { handle_reboot(); });

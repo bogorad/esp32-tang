@@ -2,89 +2,154 @@
 
 #ifdef USE_ESP32
 #include <esp_http_server.h>
+#include <esp_timer.h>
 #endif
 
 #include <cstring>
 #include <string>
 
-#include "tang_server.h"
+#include "esphome/core/hal.h"
+#include "esphome/core/log.h"
+#include "esphome/core/preferences.h"
 #include "tang_core.h"
+#include "tang_server.h"
 
 namespace esphome {
 namespace tang_server {
 
+static const char *const TAG = "tang_server";
+
 namespace {
 
-constexpr size_t kMaxTangBodySize = 4096;
+// Preference keys are new on purpose: records from other firmware versions are
+// never read through them.
+constexpr uint32_t kStatePreferenceKey = 0x54414E32;  // "TAN2"
+constexpr uint32_t kTokenPreferenceKey = 0x54414E33;  // "TAN3"
 
-struct BodyBuffer {
-  std::string body;
-  size_t expected_size{0};
-  bool complete{false};
-  bool malformed{false};
-  bool too_large{false};
+struct StatePreference {
+  uint16_t length;  // 0 = empty
+  uint8_t data[kTangRecordEncodedSize];
 };
 
-class InMemoryTangStorage : public TangStorage {
+struct TokenPreference {
+  uint32_t present;  // 1 = token valid
+  uint32_t token;
+};
+
+// Persistent storage for password mode. Created lazily: unattended mode never
+// touches preferences. ESPHome preferences are not encrypted; enable flash
+// encryption if flash extraction is in your threat model.
+class PreferencesTangStorage : public TangStorage {
  public:
-  bool is_initialized() override { return initialized_; }
+  TangStorageStatus read_state(uint8_t *buf, size_t cap, size_t *len) override {
+    if (!ensure_()) {
+      return TangStorageStatus::kError;
+    }
+    StatePreference slot{};
+    if (!state_pref_.load(&slot) || slot.length == 0) {
+      return TangStorageStatus::kEmpty;  // missing or erased
+    }
+    if (slot.length > sizeof(slot.data) || slot.length > cap) {
+      ESP_LOGE(TAG, "Stored state length %u is not plausible", slot.length);
+      return TangStorageStatus::kError;
+    }
+    std::memcpy(buf, slot.data, slot.length);
+    *len = slot.length;
+    return TangStorageStatus::kOk;
+  }
 
-  bool load_admin_private_key(uint8_t out[32]) override {
-    if (!initialized_) {
+  bool write_state(const uint8_t *buf, size_t len) override {
+    if (!ensure_() || len == 0 || len > sizeof(StatePreference::data)) {
       return false;
     }
-    std::memcpy(out, admin_private_key_, sizeof(admin_private_key_));
-    return true;
+    StatePreference slot{};
+    slot.length = static_cast<uint16_t>(len);
+    std::memcpy(slot.data, buf, len);
+    return state_pref_.save(&slot) && global_preferences->sync();
   }
 
-  bool save_admin_private_key(const uint8_t key[32]) override {
-    std::memcpy(admin_private_key_, key, sizeof(admin_private_key_));
-    return true;
+  TangStorageStatus read_reset_token(uint32_t *token) override {
+    if (!ensure_()) {
+      return TangStorageStatus::kError;
+    }
+    TokenPreference slot{};
+    if (!token_pref_.load(&slot) || slot.present != 1) {
+      return TangStorageStatus::kEmpty;
+    }
+    *token = slot.token;
+    return TangStorageStatus::kOk;
   }
 
-  bool load_tang_key_record(TangEncryptedKeyRecord *out) override {
-    if (!record_saved_ || out == nullptr) {
+  bool write_reset_token(uint32_t token) override {
+    if (!ensure_()) {
       return false;
     }
-    *out = record_;
-    return true;
-  }
-
-  bool save_tang_key_record(const TangEncryptedKeyRecord &record) override {
-    record_ = record;
-    record_saved_ = true;
-    return true;
-  }
-
-  bool mark_initialized() override {
-    initialized_ = true;
-    return true;
+    TokenPreference slot{1, token};
+    return token_pref_.save(&slot) && global_preferences->sync();
   }
 
   bool wipe() override {
-    initialized_ = false;
-    record_saved_ = false;
-    std::memset(admin_private_key_, 0, sizeof(admin_private_key_));
-    std::memset(&record_, 0, sizeof(record_));
-    return true;
+    if (!ensure_()) {
+      return false;
+    }
+    StatePreference empty_state{};
+    TokenPreference empty_token{};
+    return state_pref_.save(&empty_state) && token_pref_.save(&empty_token) && global_preferences->sync();
   }
 
  private:
-  bool initialized_{false};
-  bool record_saved_{false};
-  uint8_t admin_private_key_[32]{0};
-  TangEncryptedKeyRecord record_{};
+  bool ensure_() {
+    if (ready_) {
+      return true;
+    }
+    if (global_preferences == nullptr) {
+      ESP_LOGE(TAG, "ESPHome preferences are not available");
+      return false;
+    }
+    state_pref_ = global_preferences->make_preference<StatePreference>(kStatePreferenceKey, true);
+    token_pref_ = global_preferences->make_preference<TokenPreference>(kTokenPreferenceKey, true);
+    ready_ = true;
+    return true;
+  }
+
+  bool ready_{false};
+  ESPPreferenceObject state_pref_;
+  ESPPreferenceObject token_pref_;
 };
 
-class StaticTangClock : public TangClock {
+// Monotonic, 64-bit milliseconds since boot. A 32-bit counter would wrap
+// after 49.7 days and break key expiry.
+class EspHomeTangClock : public TangClock {
  public:
-  uint32_t millis() const override { return 0; }
+  uint64_t millis() const override {
+#ifdef USE_ESP32
+    return static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+#else
+    // Extend the 32-bit counter. loop() keeps this called far more often than
+    // every 49 days.
+    std::lock_guard<std::mutex> lock(mutex_);
+    const uint32_t now = esphome::millis();
+    if (now < last_) {
+      ++wraps_;
+    }
+    last_ = now;
+    return (static_cast<uint64_t>(wraps_) << 32) | now;
+#endif
+  }
+
+ private:
+#ifndef USE_ESP32
+  mutable std::mutex mutex_;
+  mutable uint32_t last_{0};
+  mutable uint32_t wraps_{0};
+#endif
 };
 
-class NoopTangLogger : public TangLogger {
+class EspHomeTangLogger : public TangLogger {
  public:
-  void debug(const char *message) override { (void)message; }
-  void warn(const char *message) override { (void)message; }
+  void debug(const char *message) override { ESP_LOGD(TAG, "%s", message); }
+  void warn(const char *message) override { ESP_LOGW(TAG, "%s", message); }
+  void error(const char *message) override { ESP_LOGE(TAG, "%s", message); }
 };
 
 template<typename T> std::string to_std_string(const T &value) { return std::string(value.c_str()); }
@@ -102,19 +167,14 @@ std::string request_path(AsyncWebServerRequest *request) {
 }
 
 bool is_tang_path(const std::string &path) {
-  return path == "/pub" || path.rfind("/pub/", 0) == 0 || path == "/adv" ||
-         path.rfind("/adv/", 0) == 0 || path == "/activate" ||
-         path.rfind("/activate/", 0) == 0 || path == "/deactivate" ||
-         path.rfind("/deactivate/", 0) == 0 || path == "/rec" ||
-         path.rfind("/rec/", 0) == 0;
+  return path == "/pub" || path.rfind("/pub/", 0) == 0 || path == "/adv" || path.rfind("/adv/", 0) == 0 ||
+         path == "/activate" || path.rfind("/activate/", 0) == 0 || path == "/deactivate" ||
+         path.rfind("/deactivate/", 0) == 0 || path == "/rec" || path.rfind("/rec/", 0) == 0;
 }
 
 bool is_buffered_body_path(const std::string &path) {
-  return path == "/activate" || path == "/deactivate" || path == "/rec" ||
-         path.rfind("/rec/", 0) == 0;
+  return path == "/activate" || path == "/deactivate" || path == "/rec" || path.rfind("/rec/", 0) == 0;
 }
-
-bool is_success_status(int status) { return status >= 200 && status < 300; }
 
 const char *method_to_string(AsyncWebServerRequest *request) {
   const auto method = request->method();
@@ -148,6 +208,8 @@ std::string http_status(int code) {
       return "200 OK";
     case 400:
       return "400 Bad Request";
+    case 401:
+      return "401 Unauthorized";
     case 403:
       return "403 Forbidden";
     case 404:
@@ -158,10 +220,14 @@ std::string http_status(int code) {
       return "409 Conflict";
     case 413:
       return "413 Payload Too Large";
+    case 429:
+      return "429 Too Many Requests";
     case 500:
       return "500 Internal Server Error";
     case 501:
       return "501 Not Implemented";
+    case 503:
+      return "503 Service Unavailable";
     default:
       return std::to_string(code);
   }
@@ -180,6 +246,7 @@ void send_body(AsyncWebServerRequest *request, int status, const char *content_t
 }
 
 void send_text(AsyncWebServerRequest *request, int status, const char *body) {
+  ESP_LOGW(TAG, "Rejecting request (%d): %s", status, body);
   send_body(request, status, "text/plain", body);
 }
 
@@ -188,87 +255,79 @@ void send_response(AsyncWebServerRequest *request, const TangResponse &response)
 }
 
 #ifdef USE_ESP32
-bool collect_body(AsyncWebServerRequest *request, std::string *body) {
-  if (body == nullptr) {
-    return false;
-  }
-
+// Fallback for ESPHome versions that do not deliver request bodies through
+// handleBody(): read the body from the socket. Only used when handleBody()
+// never ran for this request, so the socket has not been consumed.
+bool read_body_from_socket(AsyncWebServerRequest *request, std::string *body) {
   const size_t total = request->contentLength();
-  if (total > kMaxTangBodySize) {
-    send_text(request, 413, "Payload Too Large");
-    return false;
-  }
-
   body->clear();
   body->reserve(total);
-
   char chunk[256];
   size_t remaining = total;
   while (remaining > 0) {
-    const size_t chunk_size = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
-    const int received = httpd_req_recv(*request, chunk, chunk_size);
+    const size_t want = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+    const int received = httpd_req_recv(*request, chunk, want);
     if (received <= 0) {
       body->clear();
-      send_text(request, 400, "Bad Request: Failed to read body");
       return false;
     }
-    body->append(chunk, received);
+    body->append(chunk, static_cast<size_t>(received));
     remaining -= static_cast<size_t>(received);
   }
-
   return true;
-}
-#else
-BodyBuffer *body_buffer(AsyncWebServerRequest *request) {
-  return static_cast<BodyBuffer *>(request->_tempObject);
-}
-
-BodyBuffer *ensure_body_buffer(AsyncWebServerRequest *request, size_t total) {
-  BodyBuffer *buffer = body_buffer(request);
-  if (buffer == nullptr) {
-    buffer = new BodyBuffer();
-    request->_tempObject = buffer;
-  }
-
-  if (buffer->expected_size == 0) {
-    buffer->expected_size = total;
-  }
-  return buffer;
-}
-
-void clear_body_buffer(AsyncWebServerRequest *request) {
-  BodyBuffer *buffer = body_buffer(request);
-  delete buffer;
-  request->_tempObject = nullptr;
 }
 #endif
 
 }  // namespace
 
 struct TangHttpHandler::CoreContext {
-  explicit CoreContext(const std::string &initial_password)
-      : core(&storage, &clock, &logger),
-        ready(core.setup(initial_password.c_str())) {}
+  explicit CoreContext(TangServerComponent *parent) : core(&storage, &clock, &logger) {
+    TangConfig config;
+    config.unattended = parent->unattended();
+    if (config.unattended) {
+      config.seed_hex = parent->seed().c_str();
+      config.old_seeds_hex = parent->old_seeds();
+    } else {
+      config.initial_password = parent->initial_password().empty() ? nullptr : parent->initial_password().c_str();
+      config.reset_token = parent->reset_token();
+      config.key_lifetime_ms = parent->key_lifetime_ms();
+    }
+    ready = core.setup(config);
+  }
 
-  InMemoryTangStorage storage;
-  StaticTangClock clock;
-  NoopTangLogger logger;
+  PreferencesTangStorage storage;
+  EspHomeTangClock clock;
+  EspHomeTangLogger logger;
   TangServerCore core;
-  bool ready;
+  bool ready{false};
 };
 
 TangHttpHandler::TangHttpHandler(TangServerComponent *parent)
-    : parent_(parent),
-      core_context_(new CoreContext(parent == nullptr ? "" : parent->initial_password())) {}
+    : parent_(parent), core_context_(new CoreContext(parent)) {}
 
 TangHttpHandler::~TangHttpHandler() = default;
 
-bool TangHttpHandler::canHandle(AsyncWebServerRequest *request) const {
-  return is_tang_path(request_path(request));
+bool TangHttpHandler::ready() const { return core_context_ != nullptr && core_context_->ready; }
+
+bool TangHttpHandler::active() const { return ready() && core_context_->core.is_active(); }
+
+bool TangHttpHandler::loop() { return ready() && core_context_->core.loop(); }
+
+bool TangHttpHandler::canHandle(AsyncWebServerRequest *request) const { return is_tang_path(request_path(request)); }
+
+void TangHttpHandler::handleBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index,
+                                 size_t total) {
+  if (!is_post_request(request) || !is_buffered_body_path(request_path(request))) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(this->body_mutex_);
+  // Index 0 restarts the buffer, so an aborted upload cannot leak into the
+  // next request that happens to reuse this request object's address.
+  this->bodies_[request].on_chunk(data, len, index, total);
 }
 
 void TangHttpHandler::handleRequest(AsyncWebServerRequest *request) {
-  if (core_context_ == nullptr || !core_context_->ready) {
+  if (core_context_ == nullptr) {
     send_text(request, 500, "Tang server core unavailable");
     return;
   }
@@ -276,77 +335,61 @@ void TangHttpHandler::handleRequest(AsyncWebServerRequest *request) {
   TangRequest tang_request;
   tang_request.method = method_to_string(request);
   tang_request.path = request_path(request);
+
   if (is_post_request(request) && is_buffered_body_path(tang_request.path)) {
-#ifdef USE_ESP32
-    if (!collect_body(request, &tang_request.body)) {
+    const size_t content_length = request->contentLength();
+    bool have_buffer = false;
+    TangBodyBuffer::Status status = TangBodyBuffer::Status::kOk;
+    {
+      std::lock_guard<std::mutex> lock(this->body_mutex_);
+      auto it = this->bodies_.find(request);
+      if (it != this->bodies_.end()) {
+        have_buffer = true;
+        if (content_length > 0) {
+          status = it->second.status(content_length);
+          if (status == TangBodyBuffer::Status::kOk) {
+            tang_request.body = it->second.take();
+          }
+        }
+        this->bodies_.erase(it);  // never leave state behind for the next request
+      }
+    }
+
+    if (content_length > kTangMaxBodySize) {
+      send_text(request, 413, "Payload Too Large");
       return;
     }
+    if (content_length > 0) {
+      if (have_buffer) {
+        if (status == TangBodyBuffer::Status::kTooLarge) {
+          send_text(request, 413, "Payload Too Large");
+          return;
+        }
+        if (status != TangBodyBuffer::Status::kOk) {
+          send_text(request, 400, "Bad Request: Malformed body");
+          return;
+        }
+      } else {
+#ifdef USE_ESP32
+        if (!read_body_from_socket(request, &tang_request.body)) {
+          send_text(request, 400, "Bad Request: Failed to read body");
+          return;
+        }
 #else
-    if (request->contentLength() == 0) {
-      tang_request.body.clear();
-    } else {
-      BodyBuffer *buffer = body_buffer(request);
-      if (request->contentLength() > kMaxTangBodySize || (buffer != nullptr && buffer->too_large)) {
-        clear_body_buffer(request);
-        send_text(request, 413, "Payload Too Large");
+        send_text(request, 400, "Bad Request: Body not received");
         return;
-      }
-      if (buffer == nullptr || buffer->malformed || !buffer->complete ||
-          buffer->body.size() != request->contentLength()) {
-        clear_body_buffer(request);
-        send_text(request, 400, "Bad Request: Malformed body");
-        return;
-      }
-      tang_request.body.swap(buffer->body);
-      clear_body_buffer(request);
-    }
 #endif
-  } else if (request->contentLength() > 0) {
-    tang_request.body = "<streamed body present>";
+      }
+    }
+  } else {
+    std::lock_guard<std::mutex> lock(this->body_mutex_);
+    this->bodies_.erase(request);
   }
 
   const TangResponse response = core_context_->core.handle_request(tang_request);
-  parent_->fire_request(tang_request.path, tang_request.method, response.status);
-  if (tang_request.path == "/activate") {
-    parent_->fire_activate(is_success_status(response.status));
-  } else if (tang_request.path == "/deactivate" && is_success_status(response.status)) {
-    parent_->fire_deactivate();
-  } else if (tang_request.path == "/rec" || tang_request.path.rfind("/rec/", 0) == 0) {
-    parent_->fire_recovery(is_success_status(response.status));
-  }
+  // Sensors and automations run on the main loop, not on this (httpd) task.
+  parent_->post_request_event(tang_request.path, tang_request.method, response.status);
   send_response(request, response);
-}
-
-void TangHttpHandler::handleBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index,
-                                 size_t total) {
-#ifdef USE_ESP32
-  (void)request;
-  (void)data;
-  (void)len;
-  (void)index;
-  (void)total;
-#else
-  const std::string path = request_path(request);
-  if (!is_post_request(request) || !is_buffered_body_path(path)) {
-    return;
-  }
-
-  BodyBuffer *buffer = ensure_body_buffer(request, total);
-  if (total > kMaxTangBodySize || index + len > kMaxTangBodySize) {
-    buffer->too_large = true;
-    buffer->body.clear();
-    return;
-  }
-  if ((data == nullptr && len > 0) || index != buffer->body.size() || index + len > total ||
-      buffer->expected_size != total) {
-    buffer->malformed = true;
-    buffer->body.clear();
-    return;
-  }
-
-  buffer->body.append(reinterpret_cast<const char *>(data), len);
-  buffer->complete = index + len == total;
-#endif
 }
 
 bool TangHttpHandler::isRequestHandlerTrivial() const { return false; }

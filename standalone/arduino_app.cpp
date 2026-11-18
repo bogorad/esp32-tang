@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_timer.h>
 
 #include <cstdint>
 #include <cstring>
@@ -20,13 +21,17 @@ constexpr const char *kSetupApName = "Tang-Server-Setup";
 
 class ArduinoTangClock : public TangClock {
  public:
-  uint32_t millis() const override { return ::millis(); }
+  // 64-bit so key expiry does not wrap after 49 days.
+  uint64_t millis() const override {
+    return static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+  }
 };
 
 class ArduinoTangLogger : public TangLogger {
  public:
   void debug(const char *message) override { Serial.println(message); }
   void warn(const char *message) override { Serial.println(message); }
+  void error(const char *message) override { Serial.println(message); }
 };
 
 EEPROMTangStorage storage;

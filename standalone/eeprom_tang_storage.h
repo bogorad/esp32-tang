@@ -2,28 +2,32 @@
 
 #include <cstdint>
 
+#include "../src/tang_record.h"
 #include "../src/tang_storage.h"
 
+// EEPROM backend for the standalone (Arduino) build. Layout:
+//   [0]   uint32 slot magic
+//   [4]   uint16 blob length (0 = empty)
+//   [6]   blob (self-describing record, see tang_record.h)
+//   [..]  uint32 reset token present flag, uint32 reset token
+// Data written by older firmware uses a different layout and magic; it is
+// reported as an unrecognized record and never interpreted.
 class EEPROMTangStorage : public TangStorage {
  public:
   static constexpr int kEepromSize = 4096;
-  static constexpr int kEepromMagicAddr = 0;
-  static constexpr int kEepromAdminKeyAddr = 4;
-  static constexpr int kEepromTangKeyAddr = kEepromAdminKeyAddr + 32;
-  static constexpr int kGcmTagSize = 16;
-  static constexpr int kEepromTangTagAddr = kEepromTangKeyAddr + 32;
-  static constexpr int kGcmIvSize = 12;
-  static constexpr int kEepromTangIvAddr = kEepromTangTagAddr + kGcmTagSize;
-  static constexpr int kEepromTangVersionAddr = kEepromTangIvAddr + kGcmIvSize;
-  static constexpr uint8_t kTangKeyRecordVersion = 1;
-  static constexpr uint32_t kEepromMagicValue = 0xCAFEDEAD;
+  static constexpr uint32_t kSlotMagic = 0x54414E53;  // "TANS"
+  static constexpr int kMagicAddr = 0;
+  static constexpr int kLengthAddr = 4;
+  static constexpr int kBlobAddr = 6;
+  static constexpr int kTokenFlagAddr = kBlobAddr + static_cast<int>(kTangRecordEncodedSize);
+  static constexpr int kTokenAddr = kTokenFlagAddr + 4;
+  // Magic used by the previous layout (unsalted key derivation).
+  static constexpr uint32_t kLegacyMagic = 0xCAFEDEAD;
 
-  bool is_initialized() override;
-  bool load_admin_private_key(uint8_t out[32]) override;
-  bool save_admin_private_key(const uint8_t key[32]) override;
-  bool load_tang_key_record(TangEncryptedKeyRecord *out) override;
-  bool save_tang_key_record(const TangEncryptedKeyRecord &record) override;
-  bool mark_initialized() override;
+  TangStorageStatus read_state(uint8_t *buf, size_t cap, size_t *len) override;
+  bool write_state(const uint8_t *buf, size_t len) override;
+  TangStorageStatus read_reset_token(uint32_t *token) override;
+  bool write_reset_token(uint32_t token) override;
   bool wipe() override;
 
  private:

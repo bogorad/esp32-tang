@@ -1,6 +1,7 @@
 #include "eeprom_tang_storage.h"
 
 #include <EEPROM.h>
+
 #include <cstring>
 
 bool EEPROMTangStorage::ensure_started_() {
@@ -12,89 +13,82 @@ bool EEPROMTangStorage::ensure_started_() {
   return started_;
 }
 
-bool EEPROMTangStorage::is_initialized() {
-  if (!ensure_started_()) {
-    return false;
+TangStorageStatus EEPROMTangStorage::read_state(uint8_t *buf, size_t cap,
+                                                size_t *len) {
+  if (buf == nullptr || len == nullptr || !ensure_started_()) {
+    return TangStorageStatus::kError;
   }
 
   uint32_t magic = 0;
-  EEPROM.get(kEepromMagicAddr, magic);
-  return magic == kEepromMagicValue;
-}
-
-bool EEPROMTangStorage::load_admin_private_key(uint8_t out[32]) {
-  if (out == nullptr || !ensure_started_() || !is_initialized()) {
-    return false;
-  }
-
-  for (int i = 0; i < 32; ++i) {
-    out[i] = EEPROM.read(kEepromAdminKeyAddr + i);
-  }
-  return true;
-}
-
-bool EEPROMTangStorage::save_admin_private_key(const uint8_t key[32]) {
-  if (key == nullptr || !ensure_started_()) {
-    return false;
-  }
-
-  for (int i = 0; i < 32; ++i) {
-    EEPROM.write(kEepromAdminKeyAddr + i, key[i]);
-  }
-  return EEPROM.commit();
-}
-
-bool EEPROMTangStorage::load_tang_key_record(TangEncryptedKeyRecord *out) {
-  if (out == nullptr || !ensure_started_() || !is_initialized()) {
-    return false;
-  }
-
-  for (int i = 0; i < 32; ++i) {
-    out->ciphertext[i] = EEPROM.read(kEepromTangKeyAddr + i);
-  }
-  for (int i = 0; i < kGcmTagSize; ++i) {
-    out->tag[i] = EEPROM.read(kEepromTangTagAddr + i);
-  }
-
-  uint8_t version = EEPROM.read(kEepromTangVersionAddr);
-  if (version == kTangKeyRecordVersion) {
-    for (int i = 0; i < kGcmIvSize; ++i) {
-      out->iv[i] = EEPROM.read(kEepromTangIvAddr + i);
+  EEPROM.get(kMagicAddr, magic);
+  if (magic == kLegacyMagic) {
+    // Old layout: hand the bytes to the core, which rejects them with a clear
+    // "unrecognized format" error instead of misreading them.
+    static const uint8_t kLegacyMarker[4] = {0xDE, 0xAD, 0xFE, 0xCA};
+    if (cap < sizeof(kLegacyMarker)) {
+      return TangStorageStatus::kError;
     }
-    out->version = version;
-  } else {
-    // Legacy EEPROM records used an all-zero local AES-GCM IV and did not persist it.
-    std::memset(out->iv, 0, sizeof(out->iv));
-    out->version = 0;
+    std::memcpy(buf, kLegacyMarker, sizeof(kLegacyMarker));
+    *len = sizeof(kLegacyMarker);
+    return TangStorageStatus::kOk;
   }
-  return true;
+  if (magic != kSlotMagic) {
+    return TangStorageStatus::kEmpty;
+  }
+
+  uint16_t length = 0;
+  EEPROM.get(kLengthAddr, length);
+  if (length == 0) {
+    return TangStorageStatus::kEmpty;
+  }
+  if (length > cap || length > kTangRecordEncodedSize) {
+    return TangStorageStatus::kError;
+  }
+  for (uint16_t i = 0; i < length; ++i) {
+    buf[i] = EEPROM.read(kBlobAddr + i);
+  }
+  *len = length;
+  return TangStorageStatus::kOk;
 }
 
-bool EEPROMTangStorage::save_tang_key_record(
-    const TangEncryptedKeyRecord &record) {
-  if (!ensure_started_()) {
+bool EEPROMTangStorage::write_state(const uint8_t *buf, size_t len) {
+  if (buf == nullptr || len == 0 || len > kTangRecordEncodedSize ||
+      !ensure_started_()) {
     return false;
   }
 
-  for (int i = 0; i < 32; ++i) {
-    EEPROM.write(kEepromTangKeyAddr + i, record.ciphertext[i]);
+  for (size_t i = 0; i < len; ++i) {
+    EEPROM.write(kBlobAddr + static_cast<int>(i), buf[i]);
   }
-  for (int i = 0; i < kGcmTagSize; ++i) {
-    EEPROM.write(kEepromTangTagAddr + i, record.tag[i]);
-  }
-  for (int i = 0; i < kGcmIvSize; ++i) {
-    EEPROM.write(kEepromTangIvAddr + i, record.iv[i]);
-  }
-  EEPROM.write(kEepromTangVersionAddr, record.version);
+  EEPROM.put(kLengthAddr, static_cast<uint16_t>(len));
+  EEPROM.put(kMagicAddr, kSlotMagic);
   return EEPROM.commit();
 }
 
-bool EEPROMTangStorage::mark_initialized() {
+TangStorageStatus EEPROMTangStorage::read_reset_token(uint32_t *token) {
+  if (token == nullptr || !ensure_started_()) {
+    return TangStorageStatus::kError;
+  }
+
+  uint32_t magic = 0;
+  EEPROM.get(kMagicAddr, magic);
+  uint32_t present = 0;
+  EEPROM.get(kTokenFlagAddr, present);
+  if (magic != kSlotMagic || present != 1) {
+    return TangStorageStatus::kEmpty;
+  }
+  EEPROM.get(kTokenAddr, *token);
+  return TangStorageStatus::kOk;
+}
+
+bool EEPROMTangStorage::write_reset_token(uint32_t token) {
   if (!ensure_started_()) {
     return false;
   }
 
-  EEPROM.put(kEepromMagicAddr, kEepromMagicValue);
+  EEPROM.put(kTokenAddr, token);
+  EEPROM.put(kTokenFlagAddr, static_cast<uint32_t>(1));
+  EEPROM.put(kMagicAddr, kSlotMagic);
   return EEPROM.commit();
 }
 
@@ -103,6 +97,8 @@ bool EEPROMTangStorage::wipe() {
     return false;
   }
 
-  EEPROM.put(kEepromMagicAddr, static_cast<uint32_t>(0));
+  for (int i = 0; i < kEepromSize; ++i) {
+    EEPROM.write(i, 0);
+  }
   return EEPROM.commit();
 }
