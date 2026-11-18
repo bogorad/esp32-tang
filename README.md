@@ -11,9 +11,9 @@ share one Tang core in `components/tang_server/` (also linked from `src/`):
 
 Experimental. Verified on a host (see Tests): the core against mbedTLS 3.x,
 `jose`, and a real Clevis encrypt/decrypt round trip. The ESPHome component
-compiles with ESPHome 2026.5.1 (see the final notes of the change). Nothing in
-this tree has been run on ESP32 hardware by the change that added unattended
-mode. Do a live Clevis test on your device before you rely on it.
+compiles with ESPHome 2026.5.1 (both local examples, ESP-IDF and Arduino
+frameworks; ESPHome 2026.8 and later were not compiled). Nothing in this tree
+has been run on ESP32 hardware. Do a live Clevis test on your device before you rely on it.
 
 ## Two modes
 
