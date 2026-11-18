@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -25,13 +26,6 @@ TangResponse json_response(int status, const std::string &body) {
   TangResponse response = json_response(body);
   response.status = status;
   return response;
-}
-
-bool is_known_tang_path(const std::string &path) {
-  return path == "/adv" || path.rfind("/adv/", 0) == 0 ||
-         path == "/pub" || path == "/activate" || path == "/deactivate" ||
-         path == "/rec" ||
-         path.rfind("/rec/", 0) == 0;
 }
 
 bool encode_key_part(const uint8_t *data, std::string *out) {
@@ -123,11 +117,14 @@ struct ParsedJwePassword {
   uint8_t tag[tang::kGcmTagSize]{0};
   uint8_t ciphertext[128]{0};
   size_t ciphertext_len{0};
-  std::string protected_header;
 };
 
-bool parse_jwe_password(const std::string &body, ParsedJwePassword *out) {
-  if (out == nullptr) {
+// ParsedJwePassword holds only plain bytes, so it can be zeroed with
+// secure_zero. The protected header is public data and is returned separately
+// in a std::string (never memset a std::string).
+bool parse_jwe_password(const std::string &body, ParsedJwePassword *out,
+                        std::string *protected_header) {
+  if (out == nullptr || protected_header == nullptr) {
     return false;
   }
 
@@ -136,7 +133,7 @@ bool parse_jwe_password(const std::string &body, ParsedJwePassword *out) {
   std::string iv;
   std::string tag;
   std::string ciphertext;
-  if (!find_json_string(body, "protected", &out->protected_header) ||
+  if (!find_json_string(body, "protected", protected_header) ||
       !find_json_string(body, "x", &x) || !find_json_string(body, "y", &y) ||
       !find_json_string(body, "iv", &iv) ||
       !find_json_string(body, "ciphertext", &ciphertext) ||
@@ -233,12 +230,13 @@ bool decrypt_jwe_password(tang::TangRngContext *rng,
                           const std::string &body, std::string *password,
                           int *error_status, const char **error_body) {
   ParsedJwePassword parsed;
+  std::string protected_header;
   uint8_t shared_secret[tang::kEcPrivateKeySize]{0};
   uint8_t cek[tang::kAes128KeySize]{0};
   uint8_t plaintext[sizeof(parsed.ciphertext) + 1]{0};
   bool ok = false;
 
-  if (!parse_jwe_password(body, &parsed)) {
+  if (!parse_jwe_password(body, &parsed, &protected_header)) {
     if (error_status != nullptr) {
       *error_status = 400;
     }
@@ -275,8 +273,8 @@ bool decrypt_jwe_password(tang::TangRngContext *rng,
           plaintext, parsed.ciphertext, parsed.ciphertext_len, cek,
           sizeof(cek), parsed.iv, sizeof(parsed.iv), parsed.tag,
           sizeof(parsed.tag),
-          reinterpret_cast<const uint8_t *>(parsed.protected_header.data()),
-          parsed.protected_header.size())) {
+          reinterpret_cast<const uint8_t *>(protected_header.data()),
+          protected_header.size())) {
     if (error_status != nullptr) {
       *error_status = 401;
     }
@@ -431,16 +429,25 @@ TangResponse recovery_key_response(
   return response;
 }
 
+// One signature on an advertisement. `priv` is the signing private key.
+struct AdvSigner {
+  uint8_t pub[tang::kEcPublicKeySize];
+  uint8_t priv[tang::kEcPrivateKeySize];
+};
+
+// Build the signed /adv response. The payload advertises the current signing
+// and exchange keys only. With one signer the JWS is flattened; with several
+// (tangd signs /adv/<thp> with all current keys plus the key named by <thp>)
+// it is the general JSON serialization with a `signatures` array.
 TangResponse signed_advertisement_response(
-    tang::TangRngContext *rng,
+    tang::TangRngContext *rng, const AdvSigner *signers, size_t signer_count,
     const uint8_t signing_public_key[tang::kEcPublicKeySize],
-    const uint8_t signing_private_key[tang::kEcPrivateKeySize],
     const uint8_t exchange_public_key[tang::kEcPublicKeySize]) {
   std::string signing_jwk;
   std::string exchange_jwk;
-  std::string signing_kid;
-  if (!public_jwk(signing_public_key, "ES256", "[\"verify\"]", true,
-                  &signing_jwk, &signing_kid) ||
+  if (signer_count == 0 ||
+      !public_jwk(signing_public_key, "ES256", "[\"verify\"]", true,
+                  &signing_jwk, nullptr) ||
       !public_jwk(exchange_public_key, "ECMR", "[\"deriveKey\"]", true,
                   &exchange_jwk, nullptr)) {
     return text_response(500, "Failed to encode advertisement keys");
@@ -448,38 +455,68 @@ TangResponse signed_advertisement_response(
 
   const std::string payload = "{\"keys\":[" + signing_jwk + "," +
                               exchange_jwk + "]}";
-  const std::string protected_header =
-      "{\"alg\":\"ES256\",\"cty\":\"jwk-set+json\",\"kid\":\"" + signing_kid +
-      "\"}";
-
   std::string payload_b64;
-  std::string protected_b64;
-  if (!base64_url_encode_string(payload, &payload_b64) ||
-      !base64_url_encode_string(protected_header, &protected_b64)) {
+  if (!base64_url_encode_string(payload, &payload_b64)) {
     return text_response(500, "Failed to encode advertisement JWS");
   }
 
-  const std::string signing_input = protected_b64 + "." + payload_b64;
-  uint8_t signature[tang::kEcPublicKeySize];
-  if (!tang::sign_es256(
-          rng, signing_private_key,
-          reinterpret_cast<const uint8_t *>(signing_input.data()),
-          signing_input.size(), signature)) {
+  std::string signatures;
+  for (size_t i = 0; i < signer_count; ++i) {
+    std::string kid;
+    if (!compute_key_id(signers[i].pub, tang::ThumbprintHash::kSha256, &kid)) {
+      return text_response(500, "Failed to compute signing key id");
+    }
+    const std::string protected_header =
+        "{\"alg\":\"ES256\",\"cty\":\"jwk-set+json\",\"kid\":\"" + kid + "\"}";
+    std::string protected_b64;
+    if (!base64_url_encode_string(protected_header, &protected_b64)) {
+      return text_response(500, "Failed to encode advertisement JWS");
+    }
+
+    const std::string signing_input = protected_b64 + "." + payload_b64;
+    uint8_t signature[tang::kEcPublicKeySize];
+    if (!tang::sign_es256(
+            rng, signers[i].priv,
+            reinterpret_cast<const uint8_t *>(signing_input.data()),
+            signing_input.size(), signature)) {
+      tang::secure_zero(signature, sizeof(signature));
+      return text_response(500, "Failed to sign advertisement JWS");
+    }
+    std::string signature_b64;
+    const bool ok = base64_url_encode_string(signature, sizeof(signature),
+                                             &signature_b64);
     tang::secure_zero(signature, sizeof(signature));
-    return text_response(500, "Failed to sign advertisement JWS");
+    if (!ok) {
+      return text_response(500, "Failed to encode advertisement signature");
+    }
+
+    if (signer_count == 1) {
+      return json_response("{\"payload\":\"" + payload_b64 +
+                           "\",\"protected\":\"" + protected_b64 +
+                           "\",\"signature\":\"" + signature_b64 + "\"}");
+    }
+    if (i != 0) {
+      signatures += ",";
+    }
+    signatures += "{\"protected\":\"" + protected_b64 + "\",\"signature\":\"" +
+                  signature_b64 + "\"}";
   }
 
-  std::string signature_b64;
-  bool ok = base64_url_encode_string(signature, sizeof(signature),
-                                     &signature_b64);
-  tang::secure_zero(signature, sizeof(signature));
-  if (!ok) {
-    return text_response(500, "Failed to encode advertisement signature");
-  }
+  return json_response("{\"payload\":\"" + payload_b64 + "\",\"signatures\":[" +
+                       signatures + "]}");
+}
 
-  return json_response("{\"payload\":\"" + payload_b64 +
-                       "\",\"protected\":\"" + protected_b64 +
-                       "\",\"signature\":\"" + signature_b64 + "\"}");
+bool is_thumbprint_text(const std::string &s) {
+  if (s.empty() || s.size() > 64) {
+    return false;
+  }
+  for (char c : s) {
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+          (c >= 'A' && c <= 'Z') || c == '-' || c == '_')) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -489,42 +526,323 @@ TangServerCore::TangServerCore(TangStorage *storage, TangClock *clock,
     : storage_(storage),
       clock_(clock),
       logger_(logger),
-      initialized_(false),
+      ready_(false),
+      unattended_(false),
       active_(false),
-      activation_timestamp_(0),
-      tang_private_key_{0},
-      tang_public_key_{0},
-      admin_private_key_{0},
-      admin_public_key_{0} {}
+      key_lifetime_ms_(kDefaultKeyLifetimeMs),
+      activation_ms_(0),
+      failed_attempts_(0),
+      next_attempt_ms_(0),
+      record_{},
+      signing_{},
+      exchange_{} {}
+
+TangResponse TangServerCore::fail(int status, const char *body) {
+  if (logger_ != nullptr) {
+    std::string line = "Request rejected (" + std::to_string(status) +
+                       "): " + body;
+    logger_->warn(line.c_str());
+  }
+  return text_response(status, body);
+}
+
+TangResponse TangServerCore::fail_json(int status, const char *error,
+                                       const char *message) {
+  if (logger_ != nullptr) {
+    std::string line = "Request rejected (" + std::to_string(status) + ") " +
+                       error + ": " + message;
+    logger_->warn(line.c_str());
+  }
+  return json_response(status, std::string("{\"error\":\"") + error +
+                                   "\",\"message\":\"" + message + "\"}");
+}
 
 bool TangServerCore::setup(const char *initial_password) {
-  if (storage_ == nullptr || clock_ == nullptr || initial_password == nullptr) {
+  TangConfig config;
+  config.initial_password = initial_password;
+  return setup(config);
+}
+
+bool TangServerCore::setup(const TangConfig &config) {
+  if (clock_ == nullptr || logger_ == nullptr) {
+    return false;
+  }
+  if (!config.unattended && storage_ == nullptr) {
+    logger_->error("Password mode needs a storage backend");
+    return false;
+  }
+  if (config.unattended) {
+    return setup_unattended(config);
+  }
+  return setup_password(config);
+}
+
+bool TangServerCore::derive_keypairs(const char *seed_hex, KeyPair *signing,
+                                     KeyPair *exchange) {
+  uint8_t seed[tang::kMaxSeedBytes];
+  size_t seed_len = 0;
+  if (!tang::decode_seed_hex(seed_hex, seed, sizeof(seed), &seed_len)) {
+    tang::secure_zero(seed, sizeof(seed));
+    logger_->error(
+        "Seed is invalid: need hex, at least 64 hex chars, not degenerate");
     return false;
   }
 
-  if (storage_->is_initialized()) {
-    initialized_ = load_admin_key();
-    return initialized_;
+  bool ok =
+      tang::derive_p256_private_key(seed, seed_len, tang::kSeedRoleSigning,
+                                    signing->priv) &&
+      tang::compute_ec_public_key(&rng_, signing->priv, signing->pub) &&
+      tang::derive_p256_private_key(seed, seed_len, tang::kSeedRoleExchange,
+                                    exchange->priv) &&
+      tang::compute_ec_public_key(&rng_, exchange->priv, exchange->pub);
+  tang::secure_zero(seed, sizeof(seed));
+  if (!ok) {
+    tang::secure_zero(signing, sizeof(*signing));
+    tang::secure_zero(exchange, sizeof(*exchange));
+    logger_->error("Seed key derivation failed");
   }
-
-  initialized_ = initialize_storage(initial_password);
-  return initialized_;
+  return ok;
 }
 
-void TangServerCore::loop() {
-  if (!active_ || clock_ == nullptr) {
-    return;
+bool TangServerCore::setup_unattended(const TangConfig &config) {
+  if (config.seed_hex == nullptr || config.seed_hex[0] == '\0') {
+    logger_->error("Unattended mode needs a seed");
+    return false;
   }
 
-  if (clock_->millis() - activation_timestamp_ > kDefaultKeyLifetimeMs) {
+  KeyPair signing{};
+  KeyPair exchange{};
+  std::vector<KeyPair> old_signing;
+  std::vector<KeyPair> old_exchange;
+  bool ok = derive_keypairs(config.seed_hex, &signing, &exchange);
+  for (size_t i = 0; ok && i < config.old_seeds_hex.size(); ++i) {
+    if (config.old_seeds_hex[i] == config.seed_hex) {
+      logger_->error("An old seed equals the current seed");
+      ok = false;
+      break;
+    }
+    KeyPair os{};
+    KeyPair oe{};
+    ok = derive_keypairs(config.old_seeds_hex[i].c_str(), &os, &oe);
+    if (ok) {
+      for (const KeyPair &prev : old_exchange) {
+        if (std::memcmp(prev.pub, oe.pub, sizeof(oe.pub)) == 0) {
+          logger_->error("Two old seeds are identical");
+          ok = false;
+        }
+      }
+    }
+    if (ok) {
+      old_signing.push_back(os);
+      old_exchange.push_back(oe);
+    }
+    tang::secure_zero(&os, sizeof(os));
+    tang::secure_zero(&oe, sizeof(oe));
+  }
+
+  if (!ok) {
+    tang::secure_zero(&signing, sizeof(signing));
+    tang::secure_zero(&exchange, sizeof(exchange));
+    for (KeyPair &k : old_signing) tang::secure_zero(&k, sizeof(k));
+    for (KeyPair &k : old_exchange) tang::secure_zero(&k, sizeof(k));
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    signing_ = signing;
+    exchange_ = exchange;
+    old_signing_ = old_signing;
+    old_exchange_ = old_exchange;
+    unattended_ = true;
+    active_ = true;
+    ready_ = true;
+  }
+  tang::secure_zero(&signing, sizeof(signing));
+  tang::secure_zero(&exchange, sizeof(exchange));
+  for (KeyPair &k : old_signing) tang::secure_zero(&k, sizeof(k));
+  for (KeyPair &k : old_exchange) tang::secure_zero(&k, sizeof(k));
+  logger_->debug("Unattended mode: keys derived from seed; server active.");
+  return true;
+}
+
+bool TangServerCore::setup_password(const TangConfig &config) {
+  const bool have_password =
+      config.initial_password != nullptr && config.initial_password[0] != '\0';
+
+  uint32_t stored_token = 0;
+  const TangStorageStatus token_status = storage_->read_reset_token(&stored_token);
+  if (token_status == TangStorageStatus::kError) {
+    logger_->error("Cannot read reset token from storage; staying inactive");
+    return false;
+  }
+
+  uint8_t blob[kTangRecordEncodedSize + 64];
+  size_t blob_len = 0;
+  TangStorageStatus state_status =
+      storage_->read_state(blob, sizeof(blob), &blob_len);
+  if (state_status == TangStorageStatus::kError) {
+    logger_->error("Cannot read stored state; staying inactive");
+    return false;
+  }
+
+  if (token_status == TangStorageStatus::kOk &&
+      stored_token != config.reset_token) {
+    if (!have_password) {
+      logger_->error(
+          "reset_token changed but no initial_password is set; storage left "
+          "untouched, staying inactive");
+      return false;
+    }
+    logger_->warn("reset_token changed: wiping stored identity and creating a "
+                  "new one");
+    if (!storage_->wipe()) {
+      logger_->error("Wipe failed; staying inactive");
+      return false;
+    }
+    state_status = TangStorageStatus::kEmpty;
+  }
+
+  if (state_status == TangStorageStatus::kEmpty) {
+    if (!have_password) {
+      logger_->error(
+          "No stored record and no initial_password; staying inactive");
+      return false;
+    }
+    if (!initialize_storage(config.initial_password, config.reset_token)) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    key_lifetime_ms_ = config.key_lifetime_ms;
+    return ready_;
+  }
+
+  TangStoredState stored{};
+  const TangDecodeStatus decoded = tang_decode_state(blob, blob_len, &stored);
+  if (decoded != TangDecodeStatus::kOk) {
+    // Never generate new keys over a record we cannot read: that would change
+    // the server identity and break every Clevis binding.
+    std::string line = std::string("Stored record is not usable: ") +
+                       tang_decode_status_name(decoded) +
+                       ". Staying inactive. Change reset_token (with "
+                       "initial_password) to start over.";
+    logger_->error(line.c_str());
+    return false;
+  }
+
+  KeyPair signing{};
+  std::memcpy(signing.priv, stored.admin_private_key, sizeof(signing.priv));
+  if (!tang::compute_ec_public_key(&rng_, signing.priv, signing.pub)) {
+    logger_->error("Stored admin key is invalid; staying inactive");
+    tang::secure_zero(&stored, sizeof(stored));
+    tang::secure_zero(&signing, sizeof(signing));
+    return false;
+  }
+
+  if (token_status == TangStorageStatus::kEmpty &&
+      !storage_->write_reset_token(config.reset_token)) {
+    logger_->warn("Could not record reset token (will retry next boot)");
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    signing_ = signing;
+    record_ = stored.record;
+    key_lifetime_ms_ = config.key_lifetime_ms;
+    unattended_ = false;
+    active_ = false;
+    ready_ = true;
+  }
+  tang::secure_zero(&stored, sizeof(stored));
+  tang::secure_zero(&signing, sizeof(signing));
+  logger_->debug("Password mode: stored record loaded; waiting for activation.");
+  return true;
+}
+
+bool TangServerCore::initialize_storage(const char *initial_password,
+                                        uint32_t reset_token) {
+  KeyPair admin{};
+  KeyPair tang_key{};
+  TangStoredState state{};
+  bool ok = tang::generate_ec_keypair(&rng_, admin.pub, admin.priv) &&
+            tang::generate_ec_keypair(&rng_, tang_key.pub, tang_key.priv);
+  tang::TangRandomFunc rng_func = nullptr;
+  void *rng_ctx = nullptr;
+  if (ok) {
+    ok = tang::get_rng_context(&rng_, &rng_func, &rng_ctx) == 0 &&
+         rng_func(rng_ctx, state.record.iv, sizeof(state.record.iv)) == 0 &&
+         rng_func(rng_ctx, state.record.salt, sizeof(state.record.salt)) == 0;
+  }
+  if (ok) {
+    state.record.iterations = tang::kPasswordPbkdf2Iterations;
+    std::memcpy(state.admin_private_key, admin.priv,
+                sizeof(state.admin_private_key));
+    ok = tang::encrypt_local_data_gcm(
+        state.record.ciphertext, tang_key.priv, sizeof(tang_key.priv),
+        initial_password, std::strlen(initial_password), state.record.salt,
+        sizeof(state.record.salt), state.record.iterations, state.record.iv,
+        sizeof(state.record.iv), state.record.tag, sizeof(state.record.tag));
+  }
+  if (ok) {
+    uint8_t blob[kTangRecordEncodedSize];
+    tang_encode_state(state, blob);
+    ok = storage_->write_state(blob, sizeof(blob)) &&
+         storage_->write_reset_token(reset_token);
+    if (!ok) {
+      logger_->error("Writing the new record to storage failed");
+    }
+  } else {
+    logger_->error("Key generation or encryption failed during first setup");
+  }
+
+  if (ok) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    signing_ = admin;
+    record_ = state.record;
+    unattended_ = false;
+    active_ = false;
+    ready_ = true;
+  }
+  tang::secure_zero(&admin, sizeof(admin));
+  tang::secure_zero(&tang_key, sizeof(tang_key));
+  tang::secure_zero(&state, sizeof(state));
+  if (ok) {
+    logger_->debug("Password mode: new identity created and stored.");
+  }
+  return ok;
+}
+
+bool TangServerCore::loop() {
+  if (clock_ == nullptr) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!active_ || unattended_) {
+    return false;
+  }
+  if (clock_->millis() - activation_ms_ >= key_lifetime_ms_) {
     if (logger_ != nullptr) {
       logger_->debug("Key lifetime expired. Deactivating server automatically.");
     }
-    deactivate_server();
+    deactivate_locked();
+    return true;
   }
+  return false;
 }
 
 TangResponse TangServerCore::handle_request(const TangRequest &request) {
+  bool unattended;
+  bool ready;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    unattended = unattended_;
+    ready = ready_;
+  }
+
+  if (!ready) {
+    return fail(503, "Tang server not ready (see device log)");
+  }
+
   if (request.path == "/adv" || request.path.rfind("/adv/", 0) == 0) {
     if (request.method != "GET") {
       return text_response(405, "Method Not Allowed");
@@ -532,25 +850,21 @@ TangResponse TangServerCore::handle_request(const TangRequest &request) {
     return handle_adv(request.path);
   }
 
-  if (request.path == "/pub") {
-    if (request.method != "GET") {
+  if (request.path == "/pub" || request.path == "/activate" ||
+      request.path == "/deactivate") {
+    if (unattended) {
+      // Password-mode endpoints do not exist in unattended mode.
+      return text_response(404, "Not found");
+    }
+    const bool is_get = request.path == "/pub";
+    if (request.method != (is_get ? "GET" : "POST")) {
       return text_response(405, "Method Not Allowed");
     }
-    return handle_pub();
-  }
-
-  if (request.path == "/activate") {
-    if (request.method != "POST") {
-      return text_response(405, "Method Not Allowed");
+    if (is_get) {
+      return handle_pub();
     }
-    return handle_activate(request);
-  }
-
-  if (request.path == "/deactivate") {
-    if (request.method != "GET" && request.method != "POST") {
-      return text_response(405, "Method Not Allowed");
-    }
-    return handle_deactivate(request);
+    return request.path == "/activate" ? handle_activate(request)
+                                       : handle_deactivate(request);
   }
 
   if (request.path == "/rec" || request.path.rfind("/rec/", 0) == 0) {
@@ -560,85 +874,172 @@ TangResponse TangServerCore::handle_request(const TangRequest &request) {
     return handle_recovery(request);
   }
 
-  if (is_known_tang_path(request.path)) {
-    return text_response(405, "Method Not Allowed");
-  }
-
   return text_response(404, "Not found");
 }
 
-bool TangServerCore::is_active() const { return active_; }
+bool TangServerCore::is_active() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return active_;
+}
+
+bool TangServerCore::is_ready() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ready_;
+}
+
+bool TangServerCore::is_unattended() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return unattended_;
+}
 
 TangResponse TangServerCore::handle_adv(const std::string &path) {
-  if (!active_) {
-    return text_response(403, "Server not active");
+  std::string thp;
+  if (path != "/adv" && path != "/adv/") {
+    thp = path.substr(5);
+    if (!is_thumbprint_text(thp)) {
+      return text_response(404, "Not found");
+    }
   }
 
-  // /adv/<thp>: tangd signs with the key whose SHA-1 or SHA-256 thumbprint is
-  // <thp>. Here only the current signing key is available.
-  if (path.size() > 5) {
-    const std::string thp = path.substr(5);
-    if (!kid_matches(admin_public_key_, thp)) {
-      return text_response(404, "Unknown signing key thumbprint");
+  AdvSigner signers[2];
+  size_t signer_count = 0;
+  uint8_t signing_pub[tang::kEcPublicKeySize];
+  uint8_t exchange_pub[tang::kEcPublicKeySize];
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!active_) {
+      return fail(403, "Server not active");
+    }
+    std::memcpy(signing_pub, signing_.pub, sizeof(signing_pub));
+    std::memcpy(exchange_pub, exchange_.pub, sizeof(exchange_pub));
+    std::memcpy(signers[0].pub, signing_.pub, sizeof(signers[0].pub));
+    std::memcpy(signers[0].priv, signing_.priv, sizeof(signers[0].priv));
+    signer_count = 1;
+
+    // /adv/<thp>: like tangd, sign with the current key and, if <thp> names a
+    // rotated (hidden) signing key, with that key as well. The payload still
+    // lists only the current keys.
+    if (!thp.empty() && !kid_matches(signing_.pub, thp)) {
+      bool found = false;
+      for (const KeyPair &old : old_signing_) {
+        if (kid_matches(old.pub, thp)) {
+          std::memcpy(signers[1].pub, old.pub, sizeof(signers[1].pub));
+          std::memcpy(signers[1].priv, old.priv, sizeof(signers[1].priv));
+          signer_count = 2;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        return fail(404, "Unknown signing key thumbprint");
+      }
     }
   }
 
   if (logger_ != nullptr) {
     logger_->debug("Received request for /adv");
   }
-  return signed_advertisement_response(&rng_, admin_public_key_,
-                                       admin_private_key_, tang_public_key_);
+  TangResponse response = signed_advertisement_response(
+      &rng_, signers, signer_count, signing_pub, exchange_pub);
+  tang::secure_zero(signers, sizeof(signers));
+  return response;
 }
 
 TangResponse TangServerCore::handle_pub() {
-  if (!initialized_) {
-    return text_response(500, "Server not initialized");
+  uint8_t pub[tang::kEcPublicKeySize];
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::memcpy(pub, signing_.pub, sizeof(pub));
   }
-
   if (logger_ != nullptr) {
     logger_->debug("Received request for /pub");
   }
-  return public_key_response(admin_public_key_, false, "ECDH-ES");
+  return public_key_response(pub, false, "ECDH-ES");
+}
+
+void TangServerCore::note_password_failure_locked() {
+  if (failed_attempts_ < 31) {
+    ++failed_attempts_;
+  }
+  uint64_t delay = 1000;
+  for (uint32_t i = 1; i < failed_attempts_ && delay < kMaxBackoffMs; ++i) {
+    delay *= 2;
+  }
+  if (delay > kMaxBackoffMs) {
+    delay = kMaxBackoffMs;
+  }
+  next_attempt_ms_ = clock_->millis() + delay;
+}
+
+// Check `password` against the stored record. On success, writes the Tang
+// exchange private key to `key_out`. Runs PBKDF2 without holding the mutex so
+// that loop() and other requests are not blocked for the duration.
+static bool unlock_record(const TangEncryptedKeyRecord &record,
+                          const std::string &password,
+                          uint8_t key_out[tang::kEcPrivateKeySize]) {
+  return tang::decrypt_local_data_gcm(
+      key_out, record.ciphertext, sizeof(record.ciphertext), password.c_str(),
+      password.size(), record.salt, sizeof(record.salt), record.iterations,
+      record.iv, sizeof(record.iv), record.tag, sizeof(record.tag));
 }
 
 TangResponse TangServerCore::handle_activate(const TangRequest &request) {
-  if (active_) {
-    return text_response(400, "Already active");
+  TangEncryptedKeyRecord record;
+  uint8_t admin_priv[tang::kEcPrivateKeySize];
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_) {
+      return fail(400, "Already active");
+    }
+    if (clock_->millis() < next_attempt_ms_) {
+      return fail(429, "Too many failed attempts; retry later");
+    }
+    record = record_;
+    std::memcpy(admin_priv, signing_.priv, sizeof(admin_priv));
   }
 
   if (request.body.empty()) {
-    return text_response(400, "Bad Request: Missing body");
+    tang::secure_zero(admin_priv, sizeof(admin_priv));
+    return fail(400, "Bad Request: Missing body");
   }
 
   std::string password;
   int error_status = 400;
   const char *error_body = "Bad Request: Invalid JWE";
-  if (!decrypt_jwe_password(&rng_, admin_private_key_, request.body, &password,
-                            &error_status, &error_body)) {
-    return text_response(error_status, error_body);
+  const bool decrypted = decrypt_jwe_password(&rng_, admin_priv, request.body,
+                                              &password, &error_status,
+                                              &error_body);
+  tang::secure_zero(admin_priv, sizeof(admin_priv));
+  if (!decrypted) {
+    return fail(error_status, error_body);
   }
 
-  TangEncryptedKeyRecord record = {};
-  uint8_t decrypted_key[tang::kEcPrivateKeySize]{0};
-  const bool ok =
-      storage_->load_tang_key_record(&record) &&
-      tang::decrypt_local_data_gcm(
-          decrypted_key, record.ciphertext, sizeof(record.ciphertext),
-          password.c_str(), password.size(), record.iv, sizeof(record.iv),
-          record.tag, sizeof(record.tag)) &&
-      tang::compute_ec_public_key(&rng_, decrypted_key, tang_public_key_);
-  if (ok) {
-    std::memcpy(tang_private_key_, decrypted_key, sizeof(tang_private_key_));
-    active_ = true;
-    activation_timestamp_ = clock_->millis();
-  }
-
-  tang::secure_zero(decrypted_key, sizeof(decrypted_key));
+  uint8_t key[tang::kEcPrivateKeySize];
+  uint8_t pub[tang::kEcPublicKeySize];
+  const bool ok = unlock_record(record, password, key) &&
+                  tang::compute_ec_public_key(&rng_, key, pub);
   password.assign(password.size(), '\0');
+  password.clear();
+
   if (!ok) {
-    return text_response(401,
-                         "Activation failed: invalid password for stored key");
+    tang::secure_zero(key, sizeof(key));
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      note_password_failure_locked();
+    }
+    return fail(401, "Activation failed: invalid password for stored key");
   }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::memcpy(exchange_.priv, key, sizeof(exchange_.priv));
+    std::memcpy(exchange_.pub, pub, sizeof(exchange_.pub));
+    active_ = true;
+    activation_ms_ = clock_->millis();
+    failed_attempts_ = 0;
+    next_attempt_ms_ = 0;
+  }
+  tang::secure_zero(key, sizeof(key));
 
   if (logger_ != nullptr) {
     logger_->debug("Server activated.");
@@ -647,151 +1048,115 @@ TangResponse TangServerCore::handle_activate(const TangRequest &request) {
 }
 
 TangResponse TangServerCore::handle_deactivate(const TangRequest &request) {
-  if (request.method == "GET") {
-    deactivate_server();
-    return text_response(200, "Server deactivated");
-  }
-
-  if (!active_) {
-    return text_response(400, "Already inactive");
+  // The caller must prove the current password. Nothing is re-wrapped or
+  // written: the stored record stays byte-for-byte unchanged.
+  TangEncryptedKeyRecord record;
+  uint8_t admin_priv[tang::kEcPrivateKeySize];
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!active_) {
+      return fail(400, "Already inactive");
+    }
+    if (clock_->millis() < next_attempt_ms_) {
+      return fail(429, "Too many failed attempts; retry later");
+    }
+    record = record_;
+    std::memcpy(admin_priv, signing_.priv, sizeof(admin_priv));
   }
 
   if (request.body.empty()) {
-    return text_response(400, "Bad Request: Missing body");
+    tang::secure_zero(admin_priv, sizeof(admin_priv));
+    return fail(400, "Bad Request: Missing body");
   }
 
   std::string password;
   int error_status = 400;
   const char *error_body = "Bad Request: Invalid JWE";
-  if (!decrypt_jwe_password(&rng_, admin_private_key_, request.body, &password,
-                            &error_status, &error_body)) {
-    return text_response(error_status, error_body);
+  const bool decrypted = decrypt_jwe_password(&rng_, admin_priv, request.body,
+                                              &password, &error_status,
+                                              &error_body);
+  tang::secure_zero(admin_priv, sizeof(admin_priv));
+  if (!decrypted) {
+    return fail(error_status, error_body);
   }
 
-  TangEncryptedKeyRecord record = {};
-  record.version = 1;
-  uint8_t key_to_save[tang::kEcPrivateKeySize]{0};
-  std::memcpy(key_to_save, tang_private_key_, sizeof(key_to_save));
-  bool ok = tang::generate_random_gcm_iv(&rng_, record.iv);
-  if (ok) {
-    ok = tang::encrypt_local_data_gcm(
-        record.ciphertext, key_to_save, sizeof(key_to_save), password.c_str(),
-        password.size(), record.iv, sizeof(record.iv), record.tag,
-        sizeof(record.tag));
-  }
-  if (ok) {
-    ok = storage_->save_tang_key_record(record);
-  }
-
-  tang::secure_zero(key_to_save, sizeof(key_to_save));
+  uint8_t key[tang::kEcPrivateKeySize];
+  const bool ok = unlock_record(record, password, key);
+  tang::secure_zero(key, sizeof(key));
   password.assign(password.size(), '\0');
-  if (!ok) {
-    return text_response(500, "Failed to encrypt Tang key");
-  }
+  password.clear();
 
-  deactivate_server();
-  return text_response(200, "Key saved and server deactivated");
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!ok) {
+    note_password_failure_locked();
+    return fail(401, "Deactivation failed: invalid password for stored key");
+  }
+  failed_attempts_ = 0;
+  next_attempt_ms_ = 0;
+  deactivate_locked();
+  if (logger_ != nullptr) {
+    logger_->debug("Server deactivated on request.");
+  }
+  return text_response(200, "Server deactivated");
 }
 
 TangResponse TangServerCore::handle_recovery(const TangRequest &request) {
-  if (!active_) {
-    return text_response(403, "Server not active");
+  if (request.path == "/rec" || request.path == "/rec/") {
+    return fail_json(400, "missing_kid", "Recovery requires /rec/{kid}");
   }
 
-  constexpr const char *kRecoveryPrefix = "/rec/";
-  if (request.path == "/rec") {
-    return json_response(400,
-                         "{\"error\":\"missing_kid\","
-                         "\"message\":\"Recovery requires /rec/{kid}\"}");
+  const std::string kid = request.path.substr(5);
+  if (!is_thumbprint_text(kid)) {
+    return fail_json(400, "invalid_kid", "Recovery key id is invalid");
   }
 
-  const std::string kid = request.path.substr(std::strlen(kRecoveryPrefix));
-  if (kid.empty() || kid.find('/') != std::string::npos) {
-    return json_response(400,
-                         "{\"error\":\"invalid_kid\","
-                         "\"message\":\"Recovery key id is invalid\"}");
+  // Find the exchange key: the current one (when active) or a rotated one.
+  // Accept the SHA-256 (Clevis 17+) and SHA-1 (older) thumbprint.
+  uint8_t key[tang::kEcPrivateKeySize];
+  bool found = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!active_) {
+      return fail(403, "Server not active");
+    }
+    if (kid_matches(exchange_.pub, kid)) {
+      std::memcpy(key, exchange_.priv, sizeof(key));
+      found = true;
+    }
+    for (size_t i = 0; !found && i < old_exchange_.size(); ++i) {
+      if (kid_matches(old_exchange_[i].pub, kid)) {
+        std::memcpy(key, old_exchange_[i].priv, sizeof(key));
+        found = true;
+      }
+    }
   }
-
-  if (!kid_matches(tang_public_key_, kid)) {
-    return json_response(404,
-                         "{\"error\":\"unknown_kid\","
-                         "\"message\":\"Recovery key id is not active\"}");
+  if (!found) {
+    return fail_json(404, "unknown_kid", "Recovery key id is not active");
   }
 
   if (request.body.empty()) {
-    return json_response(400,
-                         "{\"error\":\"missing_body\","
-                         "\"message\":\"Recovery request body is required\"}");
+    tang::secure_zero(key, sizeof(key));
+    return fail_json(400, "missing_body", "Recovery request body is required");
   }
 
   ParsedRecoveryJwk parsed;
   const char *parse_error = "Recovery request is invalid";
   if (!parse_recovery_jwk(request.body, &parsed, &parse_error)) {
-    return json_response(400,
-                         "{\"error\":\"invalid_recovery_request\","
-                         "\"message\":\"" +
-                             std::string(parse_error) + "\"}");
+    tang::secure_zero(key, sizeof(key));
+    return fail_json(400, "invalid_recovery_request", parse_error);
   }
 
-  TangResponse response =
-      recovery_key_response(&rng_, tang_private_key_, parsed.public_key);
+  TangResponse response = recovery_key_response(&rng_, key, parsed.public_key);
+  tang::secure_zero(key, sizeof(key));
   tang::secure_zero(&parsed, sizeof(parsed));
+  if (response.status != 200 && logger_ != nullptr) {
+    logger_->warn("Recovery request rejected: invalid client key");
+  }
   return response;
 }
 
-void TangServerCore::deactivate_server() {
-  tang::secure_zero(tang_private_key_, sizeof(tang_private_key_));
-  tang::secure_zero(tang_public_key_, sizeof(tang_public_key_));
+void TangServerCore::deactivate_locked() {
+  tang::secure_zero(&exchange_, sizeof(exchange_));
   active_ = false;
-  activation_timestamp_ = 0;
-}
-
-bool TangServerCore::load_admin_key() {
-  if (!storage_->load_admin_private_key(admin_private_key_)) {
-    return false;
-  }
-
-  return tang::compute_ec_public_key(&rng_, admin_private_key_,
-                                     admin_public_key_);
-}
-
-bool TangServerCore::initialize_storage(const char *initial_password) {
-  uint8_t generated_tang_private_key[tang::kEcPrivateKeySize] = {0};
-  uint8_t generated_tang_public_key[tang::kEcPublicKeySize] = {0};
-  TangEncryptedKeyRecord record = {};
-  record.version = 1;
-
-  tang::TangRandomFunc rng_func = nullptr;
-  void *rng_ctx = nullptr;
-  bool ok = tang::generate_ec_keypair(&rng_, admin_public_key_,
-                                      admin_private_key_);
-  if (ok) {
-    ok = tang::generate_ec_keypair(&rng_, generated_tang_public_key,
-                                   generated_tang_private_key);
-  }
-  if (ok) {
-    ok = tang::get_rng_context(&rng_, &rng_func, &rng_ctx) == 0 &&
-         rng_func(rng_ctx, record.iv, sizeof(record.iv)) == 0;
-  }
-  if (ok) {
-    ok = tang::encrypt_local_data_gcm(
-        record.ciphertext, generated_tang_private_key,
-        sizeof(generated_tang_private_key), initial_password,
-        std::strlen(initial_password), record.iv, sizeof(record.iv), record.tag,
-        sizeof(record.tag));
-  }
-  if (ok) {
-    ok = storage_->save_admin_private_key(admin_private_key_) &&
-         storage_->save_tang_key_record(record) && storage_->mark_initialized();
-  }
-
-  tang::secure_zero(generated_tang_private_key,
-                    sizeof(generated_tang_private_key));
-  tang::secure_zero(generated_tang_public_key,
-                    sizeof(generated_tang_public_key));
-  if (!ok) {
-    tang::secure_zero(admin_private_key_, sizeof(admin_private_key_));
-    tang::secure_zero(admin_public_key_, sizeof(admin_public_key_));
-  }
-  return ok;
+  activation_ms_ = 0;
 }

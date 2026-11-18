@@ -10,7 +10,9 @@
 #include <mbedtls/base64.h>
 #include <mbedtls/ecdsa.h>
 #include <mbedtls/ecp.h>
+#include <mbedtls/bignum.h>
 #include <mbedtls/gcm.h>
+#include <mbedtls/md.h>
 #include <mbedtls/sha1.h>
 #include <mbedtls/sha256.h>
 
@@ -39,11 +41,23 @@ TangRngContext::~TangRngContext() {
   initialized = false;
 }
 
+int rng_callback(void *ctx, unsigned char *output, size_t len) {
+  TangRngContext *rng = static_cast<TangRngContext *>(ctx);
+  if (rng == nullptr || !rng->initialized) {
+    return MBEDTLS_ERR_CTR_DRBG_ENTROPY_SOURCE_FAILED;
+  }
+  // mbedtls_ctr_drbg is not thread safe; httpd and main-loop tasks may both
+  // reach this.
+  std::lock_guard<std::mutex> lock(rng->mutex);
+  return mbedtls_ctr_drbg_random(&rng->ctr_drbg, output, len);
+}
+
 int init_rng(TangRngContext *rng) {
   if (rng == nullptr) {
     return -1;
   }
 
+  std::lock_guard<std::mutex> lock(rng->mutex);
   if (rng->initialized) {
     return 0;
   }
@@ -64,6 +78,7 @@ void cleanup_rng(TangRngContext *rng) {
   if (rng == nullptr) {
     return;
   }
+  std::lock_guard<std::mutex> lock(rng->mutex);
 
   mbedtls_ctr_drbg_free(&rng->ctr_drbg);
   mbedtls_entropy_free(&rng->entropy);
@@ -83,8 +98,8 @@ int get_rng_context(TangRngContext *rng, TangRandomFunc *rng_func,
     return ret;
   }
 
-  *rng_func = mbedtls_ctr_drbg_random;
-  *rng_ctx = &rng->ctr_drbg;
+  *rng_func = rng_callback;
+  *rng_ctx = rng;
   return 0;
 }
 
@@ -232,8 +247,7 @@ bool generate_ec_keypair(TangRngContext *rng, uint8_t pub_key[kEcPublicKeySize],
 
   int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
   if (ret == 0) {
-    ret = mbedtls_ecp_gen_keypair(&grp, &d, &Q, mbedtls_ctr_drbg_random,
-                                  &rng->ctr_drbg);
+    ret = mbedtls_ecp_gen_keypair(&grp, &d, &Q, rng_callback, rng);
   }
   if (ret == 0) {
     ret = mbedtls_mpi_write_binary(&d, priv_key, kEcPrivateKeySize);
@@ -274,8 +288,7 @@ bool compute_ec_public_key(TangRngContext *rng,
     ret = mbedtls_mpi_read_binary(&d, priv_key, kEcPrivateKeySize);
   }
   if (ret == 0) {
-    ret = mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, mbedtls_ctr_drbg_random,
-                          &rng->ctr_drbg);
+    ret = mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, rng_callback, rng);
   }
   if (ret == 0) {
     ret = mbedtls_mpi_write_binary(&Q.MBEDTLS_PRIVATE(X), pub_key,
@@ -330,8 +343,7 @@ bool compute_ecdh_shared_secret(TangRngContext *rng,
     ret = mbedtls_ecp_check_pubkey(&grp, &Q);
   }
   if (ret == 0) {
-    ret = mbedtls_ecp_mul(&grp, &Q, &d, &Q, mbedtls_ctr_drbg_random,
-                          &rng->ctr_drbg);
+    ret = mbedtls_ecp_mul(&grp, &Q, &d, &Q, rng_callback, rng);
   }
   if (ret == 0) {
     ret = mbedtls_mpi_write_binary(&Q.MBEDTLS_PRIVATE(X), shared_secret,
@@ -383,8 +395,7 @@ bool compute_ec_point_multiply(TangRngContext *rng,
     ret = mbedtls_ecp_check_pubkey(&grp, &input);
   }
   if (ret == 0) {
-    ret = mbedtls_ecp_mul(&grp, &output, &d, &input, mbedtls_ctr_drbg_random,
-                          &rng->ctr_drbg);
+    ret = mbedtls_ecp_mul(&grp, &output, &d, &input, rng_callback, rng);
   }
   if (ret == 0) {
     ret = mbedtls_mpi_write_binary(&output.MBEDTLS_PRIVATE(X), output_pub_key,
@@ -475,7 +486,7 @@ bool sign_es256(TangRngContext *rng, const uint8_t priv_key[kEcPrivateKeySize],
   }
   if (ret == 0) {
     ret = mbedtls_ecdsa_sign(&grp, &r, &s, &d, digest, sizeof(digest),
-                             mbedtls_ctr_drbg_random, &rng->ctr_drbg);
+                             rng_callback, rng);
   }
   if (ret == 0) {
     ret = mbedtls_mpi_write_binary(&r, signature, kEcPrivateKeySize);
@@ -571,32 +582,229 @@ bool jwe_gcm_decrypt(uint8_t *plaintext, const uint8_t *ciphertext,
   return ret == 0;
 }
 
+bool hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data,
+                 size_t data_len, uint8_t out[kSha256DigestSize]) {
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (info == nullptr || out == nullptr || (key == nullptr && key_len != 0) ||
+      (data == nullptr && data_len != 0)) {
+    return false;
+  }
+  static const uint8_t kEmpty = 0;
+  return mbedtls_md_hmac(info, key == nullptr ? &kEmpty : key, key_len,
+                         data == nullptr ? &kEmpty : data, data_len,
+                         out) == 0;
+}
+
+bool hkdf_sha256_extract(const uint8_t *salt, size_t salt_len,
+                         const uint8_t *ikm, size_t ikm_len,
+                         uint8_t prk[kSha256DigestSize]) {
+  // RFC 5869: PRK = HMAC-Hash(salt, IKM). An empty salt means HashLen zeros;
+  // an empty HMAC key is zero-padded to the block size, which is equivalent.
+  return hmac_sha256(salt, salt_len, ikm, ikm_len, prk);
+}
+
+bool hkdf_sha256_expand(const uint8_t prk[kSha256DigestSize],
+                        const uint8_t *info, size_t info_len, uint8_t *okm,
+                        size_t okm_len) {
+  const mbedtls_md_info_t *info_md =
+      mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (info_md == nullptr || prk == nullptr || okm == nullptr ||
+      (info == nullptr && info_len != 0) || okm_len == 0 ||
+      okm_len > 255 * kSha256DigestSize) {
+    return false;
+  }
+
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  uint8_t t[kSha256DigestSize];
+  size_t t_len = 0;
+  size_t produced = 0;
+  bool ok = mbedtls_md_setup(&ctx, info_md, 1) == 0;
+  for (uint8_t counter = 1; ok && produced < okm_len; ++counter) {
+    ok = mbedtls_md_hmac_starts(&ctx, prk, kSha256DigestSize) == 0 &&
+         (t_len == 0 || mbedtls_md_hmac_update(&ctx, t, t_len) == 0) &&
+         (info_len == 0 || mbedtls_md_hmac_update(&ctx, info, info_len) == 0) &&
+         mbedtls_md_hmac_update(&ctx, &counter, 1) == 0 &&
+         mbedtls_md_hmac_finish(&ctx, t) == 0;
+    if (ok) {
+      t_len = sizeof(t);
+      const size_t n = (okm_len - produced) < t_len ? (okm_len - produced)
+                                                     : t_len;
+      std::memcpy(okm + produced, t, n);
+      produced += n;
+    }
+  }
+  mbedtls_md_free(&ctx);
+  secure_zero(t, sizeof(t));
+  if (!ok) {
+    secure_zero(okm, okm_len);
+  }
+  return ok;
+}
+
+bool pbkdf2_hmac_sha256(const uint8_t *password, size_t password_len,
+                        const uint8_t *salt, size_t salt_len,
+                        uint32_t iterations, uint8_t *out, size_t out_len) {
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (info == nullptr || (password == nullptr && password_len != 0) ||
+      salt == nullptr || salt_len == 0 || iterations == 0 || out == nullptr ||
+      out_len == 0) {
+    return false;
+  }
+
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  bool ok = mbedtls_md_setup(&ctx, info, 1) == 0;
+  static const uint8_t kEmpty = 0;
+  const uint8_t *key = password == nullptr ? &kEmpty : password;
+  if (ok) {
+    ok = mbedtls_md_hmac_starts(&ctx, key, password_len) == 0;
+  }
+
+  size_t produced = 0;
+  for (uint32_t block = 1; ok && produced < out_len; ++block) {
+    uint8_t be[4];
+    write_be32(be, block);
+    uint8_t u[kSha256DigestSize];
+    uint8_t acc[kSha256DigestSize];
+    ok = mbedtls_md_hmac_reset(&ctx) == 0 &&
+         mbedtls_md_hmac_update(&ctx, salt, salt_len) == 0 &&
+         mbedtls_md_hmac_update(&ctx, be, sizeof(be)) == 0 &&
+         mbedtls_md_hmac_finish(&ctx, u) == 0;
+    if (ok) {
+      std::memcpy(acc, u, sizeof(acc));
+      for (uint32_t i = 1; ok && i < iterations; ++i) {
+        ok = mbedtls_md_hmac_reset(&ctx) == 0 &&
+             mbedtls_md_hmac_update(&ctx, u, sizeof(u)) == 0 &&
+             mbedtls_md_hmac_finish(&ctx, u) == 0;
+        if (ok) {
+          for (size_t j = 0; j < sizeof(acc); ++j) {
+            acc[j] ^= u[j];
+          }
+        }
+      }
+    }
+    if (ok) {
+      const size_t n = (out_len - produced) < sizeof(acc) ? (out_len - produced)
+                                                          : sizeof(acc);
+      std::memcpy(out + produced, acc, n);
+      produced += n;
+    }
+    secure_zero(u, sizeof(u));
+    secure_zero(acc, sizeof(acc));
+  }
+  mbedtls_md_free(&ctx);
+  if (!ok) {
+    secure_zero(out, out_len);
+  }
+  return ok;
+}
+
+bool decode_seed_hex(const char *hex, uint8_t *out, size_t out_capacity,
+                     size_t *out_len) {
+  if (hex == nullptr || out == nullptr || out_len == nullptr) {
+    return false;
+  }
+  const size_t len = std::strlen(hex);
+  if (len % 2 != 0 || len / 2 < kMinSeedBytes || len / 2 > out_capacity) {
+    return false;
+  }
+  for (size_t i = 0; i < len; ++i) {
+    const char c = hex[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F'))) {
+      return false;
+    }
+  }
+  for (size_t i = 0; i < len / 2; ++i) {
+    auto nibble = [](char c) -> uint8_t {
+      if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+      if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+      return static_cast<uint8_t>(c - 'A' + 10);
+    };
+    out[i] = static_cast<uint8_t>((nibble(hex[2 * i]) << 4) |
+                                  nibble(hex[2 * i + 1]));
+  }
+  *out_len = len / 2;
+
+  // Reject obviously degenerate seeds (all-zero, repeated byte, tiny alphabet).
+  bool seen[256] = {false};
+  size_t distinct = 0;
+  for (size_t i = 0; i < *out_len; ++i) {
+    if (!seen[out[i]]) {
+      seen[out[i]] = true;
+      ++distinct;
+    }
+  }
+  if (distinct < kMinSeedDistinctBytes) {
+    secure_zero(out, out_capacity);
+    *out_len = 0;
+    return false;
+  }
+  return true;
+}
+
+bool derive_p256_private_key(const uint8_t *seed, size_t seed_len,
+                             const char *role, uint8_t priv_key[kEcPrivateKeySize]) {
+  if (seed == nullptr || seed_len < kMinSeedBytes || role == nullptr ||
+      priv_key == nullptr) {
+    return false;
+  }
+
+  uint8_t prk[kSha256DigestSize];
+  if (!hkdf_sha256_extract(
+          reinterpret_cast<const uint8_t *>(kSeedSalt),
+          std::strlen(kSeedSalt), seed, seed_len, prk)) {
+    secure_zero(prk, sizeof(prk));
+    return false;
+  }
+
+  mbedtls_ecp_group grp;
+  mbedtls_ecp_group_init(&grp);
+  mbedtls_mpi d;
+  mbedtls_mpi_init(&d);
+  bool found = false;
+  int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+
+  // Info = "esp32-tang/v1/" role 0x00 counter(1 byte). Rejection sampling with
+  // a counter: candidates are uniform 256-bit values; keep the first with
+  // 1 <= d < n. No modulo bias. A reject has probability about 2^-32.
+  const std::string prefix = std::string(kSeedSalt) + "/" + role;
+  for (int counter = 0; ret == 0 && counter < 256 && !found; ++counter) {
+    std::string info = prefix;
+    info.push_back('\0');
+    info.push_back(static_cast<char>(counter));
+    uint8_t okm[kEcPrivateKeySize];
+    if (!hkdf_sha256_expand(prk, reinterpret_cast<const uint8_t *>(info.data()),
+                            info.size(), okm, sizeof(okm))) {
+      ret = -1;
+    } else if (mbedtls_mpi_read_binary(&d, okm, sizeof(okm)) != 0) {
+      ret = -1;
+    } else if (mbedtls_mpi_cmp_int(&d, 1) >= 0 &&
+               mbedtls_mpi_cmp_mpi(&d, &grp.N) < 0) {
+      std::memcpy(priv_key, okm, sizeof(okm));
+      found = true;
+    }
+    secure_zero(okm, sizeof(okm));
+  }
+
+  mbedtls_mpi_free(&d);
+  mbedtls_ecp_group_free(&grp);
+  secure_zero(prk, sizeof(prk));
+  return ret == 0 && found;
+}
+
 bool derive_key_from_password(uint8_t *output_key, size_t key_len,
-                              const char *password, size_t password_len) {
+                              const char *password, size_t password_len,
+                              const uint8_t *salt, size_t salt_len,
+                              uint32_t iterations) {
   if (output_key == nullptr || password == nullptr ||
       key_len > kSha256DigestSize) {
     return false;
   }
-
-  mbedtls_sha256_context sha_ctx;
-  uint8_t hash[kSha256DigestSize];
-
-  mbedtls_sha256_init(&sha_ctx);
-  int ret = mbedtls_sha256_starts(&sha_ctx, 0);
-  if (ret == 0) {
-    ret = mbedtls_sha256_update(
-        &sha_ctx, reinterpret_cast<const uint8_t *>(password), password_len);
-  }
-  if (ret == 0) {
-    ret = mbedtls_sha256_finish(&sha_ctx, hash);
-  }
-  mbedtls_sha256_free(&sha_ctx);
-
-  if (ret == 0) {
-    std::memcpy(output_key, hash, key_len);
-  }
-  secure_zero(hash, sizeof(hash));
-  return ret == 0;
+  return pbkdf2_hmac_sha256(reinterpret_cast<const uint8_t *>(password),
+                            password_len, salt, salt_len, iterations,
+                            output_key, key_len);
 }
 
 bool generate_random_gcm_iv(TangRngContext *rng, uint8_t iv[kGcmIvSize]) {
@@ -604,20 +812,23 @@ bool generate_random_gcm_iv(TangRngContext *rng, uint8_t iv[kGcmIvSize]) {
     return false;
   }
 
-  return mbedtls_ctr_drbg_random(&rng->ctr_drbg, iv, kGcmIvSize) == 0;
+  return rng_callback(rng, iv, kGcmIvSize) == 0;
 }
 
 bool encrypt_local_data_gcm(uint8_t *ciphertext, const uint8_t *plaintext,
                             size_t data_len, const char *password,
-                            size_t password_len, const uint8_t *iv,
-                            size_t iv_len, uint8_t *tag, size_t tag_len) {
+                            size_t password_len, const uint8_t *salt,
+                            size_t salt_len, uint32_t iterations,
+                            const uint8_t *iv, size_t iv_len, uint8_t *tag,
+                            size_t tag_len) {
   if (ciphertext == nullptr || plaintext == nullptr || password == nullptr ||
       iv == nullptr || tag == nullptr) {
     return false;
   }
 
   uint8_t key[kAes128KeySize];
-  if (!derive_key_from_password(key, sizeof(key), password, password_len)) {
+  if (!derive_key_from_password(key, sizeof(key), password, password_len, salt,
+                                salt_len, iterations)) {
     return false;
   }
 
@@ -639,16 +850,18 @@ bool encrypt_local_data_gcm(uint8_t *ciphertext, const uint8_t *plaintext,
 
 bool decrypt_local_data_gcm(uint8_t *plaintext, const uint8_t *ciphertext,
                             size_t data_len, const char *password,
-                            size_t password_len, const uint8_t *iv,
-                            size_t iv_len, const uint8_t *tag,
-                            size_t tag_len) {
+                            size_t password_len, const uint8_t *salt,
+                            size_t salt_len, uint32_t iterations,
+                            const uint8_t *iv, size_t iv_len,
+                            const uint8_t *tag, size_t tag_len) {
   if (plaintext == nullptr || ciphertext == nullptr || password == nullptr ||
       iv == nullptr || tag == nullptr) {
     return false;
   }
 
   uint8_t key[kAes128KeySize];
-  if (!derive_key_from_password(key, sizeof(key), password, password_len)) {
+  if (!derive_key_from_password(key, sizeof(key), password, password_len, salt,
+                                salt_len, iterations)) {
     return false;
   }
 

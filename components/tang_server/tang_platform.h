@@ -5,7 +5,9 @@
 class TangClock {
  public:
   virtual ~TangClock() = default;
-  virtual uint32_t millis() const = 0;
+  // Monotonic milliseconds since boot. 64-bit so key lifetimes never wrap
+  // (a 32-bit counter wraps after 49.7 days).
+  virtual uint64_t millis() const = 0;
 };
 
 class TangLogger {
@@ -13,4 +15,5 @@ class TangLogger {
   virtual ~TangLogger() = default;
   virtual void debug(const char *message) = 0;
   virtual void warn(const char *message) = 0;
+  virtual void error(const char *message) = 0;
 };
