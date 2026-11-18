@@ -154,7 +154,8 @@ class EspHomeTangLogger : public TangLogger {
 
 template<typename T> std::string to_std_string(const T &value) { return std::string(value.c_str()); }
 
-std::string to_std_string(const char *value) { return value == nullptr ? "" : std::string(value); }
+// Used where url()/url_to() yields a plain C string; unused on some targets.
+[[maybe_unused]] std::string to_std_string(const char *value) { return value == nullptr ? "" : std::string(value); }
 
 std::string request_path(AsyncWebServerRequest *request) {
 #ifdef USE_ESP32
