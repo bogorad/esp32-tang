@@ -88,3 +88,17 @@ keys, encrypted local key data, and wipe operations.
 No current declaration moves directly into ESPHome. ESPHome gets its own adapter
 over the shared core instead of reusing Arduino `WebServer`, standalone Wi-Fi,
 serial wipe, or ESP-IDF Arduino bootstrap code.
+
+## Modes, storage and tests
+
+- Unattended mode derives keys from a seed in RAM and never calls
+  `TangStorage`. Password mode stores one self-describing record
+  (`tang_record.h`: magic, version, length, SHA-256) and a reset token through
+  `TangStorage`. Backends store opaque bytes and never interpret them.
+- `tang_body_buffer.*` holds the POST body reassembly logic as plain C++ so the
+  ESPHome adapter and the host tests use the same code.
+- The core guards its state with one mutex. Slow work (PBKDF2) runs outside it.
+  Adapters must not call sensor or automation code from the HTTP task; the
+  ESPHome adapter queues events for the main loop.
+- Host tests live in `tests/` and build only `components/tang_server/*.cpp`
+  that have no platform includes. Run them with `make test`.

@@ -190,3 +190,8 @@ full-setup: setup-target menuconfig build
 .PHONY: test
 test:
 	tests/run.sh
+
+# ESPHome config-validation tests (needs esphome; runs in nix shell if absent).
+.PHONY: test-esphome
+test-esphome:
+	tests/esphome_config.sh

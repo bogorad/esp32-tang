@@ -1,95 +1,150 @@
 # ESP32 Tang Server
 
-Experimental Tang server firmware for ESP32. The repo now has two build
-surfaces that share one Tang core:
+Tang server (Clevis network unlock for LUKS) for ESP32. Two build surfaces
+share one Tang core in `components/tang_server/` (also linked from `src/`):
 
-- Standalone ESP-IDF/Arduino firmware.
-- ESPHome external component under `components/tang_server`.
+- ESPHome external component `tang_server` (the maintained path).
+- Standalone ESP-IDF/Arduino firmware in `main/` and `standalone/`
+  (password mode only; not compiled in this change, see Status).
 
-The shared Tang logic lives in `src/`. Standalone glue lives in `standalone/`
-and ESPHome glue lives in `components/tang_server/`.
+## Status
 
-## Current Status
+Experimental. Verified on a host (see Tests): the core against mbedTLS 3.x,
+`jose`, and a real Clevis encrypt/decrypt round trip. The ESPHome component
+compiles with ESPHome 2026.5.1 (see the final notes of the change). Nothing in
+this tree has been run on ESP32 hardware by the change that added unattended
+mode. Do a live Clevis test on your device before you rely on it.
 
-This implementation is still experimental. It supports ESPHome compilation,
-standalone compilation, Tang advertisement/admin endpoints, activation and
-deactivation flow plumbing, ESPHome automations, and optional ESPHome status
-entities.
+## Two modes
 
-Runtime curl validation still requires a real ESP32 on the network. Protocol
-compatibility work has advanced, but live Clevis interoperability remains a
-separate validation step.
+| | Password mode (default) | Unattended mode |
+|---|---|---|
+| Keys | random, stored in flash | derived from `seed` at every boot |
+| After boot | needs `POST /activate` | active at once |
+| Expiry | `key_lifetime` (default 1 h) | none |
+| Flash writes | key record, reset token | none |
+| `/pub`, `/activate`, `/deactivate` | work | `404` |
+| Power outage recovery | needs a person or a script | works with nobody present |
 
-## Standalone Build
-
-Build the original standalone firmware from this repo:
-
-```bash
-make build
-```
-
-The expected firmware artifact is:
-
-```text
-build/esp32-tang.bin
-```
-
-Standalone firmware owns its Wi-Fi setup, serial `NUKE` handling, Arduino
-`WebServer`, and `/reboot` endpoint.
-
-## ESPHome Build
-
-The ESPHome integration is an external component named `tang_server`.
-ESPHome owns Wi-Fi, logging, OTA, native API, and the HTTP server lifecycle.
-The component registers Tang routes through ESPHome `web_server_base`.
-
-Compile the included example with Docker:
-
-```bash
-docker compose run --rm esphome
-```
-
-That command uses `scripts/esphome-compile.sh`, stages compile-only secrets in
-`/tmp` inside the container, and compiles `examples/tang_server.yaml`.
-
-Use this shape from an ESPHome YAML file:
+## Unattended mode (for unattended LUKS unlock)
 
 ```yaml
-external_components:
-  - source:
-      type: local
-      path: ./components
-    components: [tang_server]
-
 tang_server:
   id: tang_component
-  initial_password: !secret tang_initial_password
-  key_lifetime: 1h
+  unattended: true
+  seed: !secret tang_seed       # openssl rand -hex 32 ; one per device
+  # old_seeds:                  # rotation only, see below
+  #   - !secret tang_old_seed
 ```
 
-Required ESPHome secrets for the included example:
+`seed` is required, hex, at least 64 hex characters (32 bytes), at most 256.
+The build fails otherwise. Degenerate seeds (fewer than 8 distinct bytes) are
+refused too. Put it in `secrets.yaml` as a quoted string.
+
+Also set `reboot_timeout: 0s` for `api:` and `wifi:` (see
+`esphome-tang/esp32tang-unattended.yaml`). The ESPHome default reboots the
+device after 15 minutes without a Home Assistant connection. A Tang server must
+keep serving without Home Assistant.
+
+### How the keys are made
+
+- IKM = the decoded seed bytes. HKDF-SHA256, salt = the ASCII string
+  `esp32-tang/v1`.
+- Signing key and exchange key use distinct `info` strings:
+  `esp32-tang/v1/signing` and `esp32-tang/v1/exchange`, each followed by a
+  zero byte and a one-byte counter.
+- The 32-byte output must be in [1, n-1] for P-256. If not, the counter
+  increases and HKDF runs again (rejection sampling; no modulo bias).
+- The same seed gives the same keys on every boot and every build. The
+  derivation is pinned by a known-answer test, cross-checked with an
+  independent Go program (`tests/ref/derive.go`). Never change it for an
+  existing deployment.
+
+### Threat model (read this)
+
+- **The seed is in the firmware image.** Anyone who gets one ESP32's flash, or
+  the firmware binary or the build directory, has the Tang keys. With the keys
+  and the encrypted disk they can unlock it. Without the seed the device is
+  just a normal Tang server.
+- Anyone who can reach the device on the network can use it as a Tang server.
+  That is the Tang model: it is safe against someone who only sees the traffic,
+  not against someone who can both reach a server and read the disk.
+- Enable **ESP32 flash encryption and secure boot** for any device that is not
+  physically controlled. The seed in `secrets.yaml` and in ESPHome's build
+  directory is plain text on the build host.
+- Use **one different seed per device**, and keep an offline backup of each
+  seed. Do not reuse the seed of a lost or stolen device.
+- With Clevis `sss` and `t=1` of 3 servers, **any one** server (or its seed) is
+  enough to unlock. This gives availability, not extra security. Use `t=2` of 3
+  if one stolen device must not be enough.
+- Reflashing with the same seed keeps the server identity, so existing Clevis
+  bindings keep working. A new seed is a new identity: every disk bound to it
+  must be re-bound.
+- Plain HTTP carries the Tang exchange. That is normal for Tang, but keep the
+  servers on a network you trust against an active attacker.
+
+### Rotation (`old_seeds`)
+
+`old_seeds` follows tangd's hidden rotated keys:
+
+- The exchange keys of old seeds stay valid for `POST /rec/<kid>`, so existing
+  bindings still unlock.
+- They are not advertised: `/adv` lists only the current signing and exchange
+  keys.
+- The old signing keys may co-sign `GET /adv/<thp>` when `<thp>` is the
+  thumbprint of that old signing key. The reply is then a general JWS with two
+  signatures (current key and old key), like tangd. `GET /adv` is signed by the
+  current key only.
+
+Steps: set the new `seed`, move the old one to `old_seeds`, flash, re-bind
+every disk (`clevis luks regen` / bind again) to the new key, then remove the
+old seed on the next flash.
+
+### Key IDs
+
+`/rec/<kid>` and `/adv/<thp>` accept the RFC 7638 thumbprint of the key as
+base64url without padding, as **SHA-256 or SHA-1**, like tangd. Clevis 17 and
+later send SHA-256.
+
+## Password mode
 
 ```yaml
-wifi_ssid: "..."
-wifi_password: "..."
-tang_web_user: "..."
-tang_web_password: "..."
-tang_initial_password: "..."
+tang_server:
+  id: tang_component
+  initial_password: !secret tang_initial_password   # 1 to 128 bytes
+  key_lifetime: 1h          # 64-bit; values above 49 days work
+  reset_token: 0            # see below
 ```
 
-## HTTP Endpoints
-
-The ESPHome and standalone adapters both route Tang behavior through the shared
-core.
-
-- `GET /pub`: return the admin public key JWK used by the activation flow.
-- `GET /adv`: return the active Tang advertisement.
-- `POST /activate`: accept a JWE body and activate the stored Tang key.
-- `GET /deactivate`: deactivate the in-memory Tang key.
-- `POST /deactivate`: accept a JWE body, re-encrypt stored Tang key material,
-  and deactivate.
-- `POST /rec/{kid}`: perform the recovery handoff for a known active key id.
-- `GET /reboot`: standalone-only.
+- On first boot the component creates an admin (signing) key and a Tang
+  exchange key. The exchange key is encrypted with a key from
+  `initial_password` using **PBKDF2-HMAC-SHA256, random 16-byte salt, 20000
+  iterations** (about 0.3 to 1 s on an ESP32; an estimate, not measured on
+  hardware). Both are stored in ESPHome preferences in a versioned record
+  (magic, version, length, SHA-256 checksum).
+- Flash is not encrypted by ESPHome preferences. Enable flash encryption if
+  flash extraction is in your threat model.
+- The key is held in RAM after `POST /activate` and erased after
+  `key_lifetime` or `POST /deactivate`. Expiry uses a 64-bit monotonic clock.
+- `POST /deactivate` needs the current password. It only erases the key from
+  RAM. It does not change the stored record. A wrong password returns 401.
+  `GET /deactivate` does not exist (405).
+- Wrong passwords on `/activate` and `/deactivate` back off: 1 s after the
+  first failure, doubling, at most 5 min (`429`). The counter lives in RAM.
+- A stored record that fails validation (corrupt, other format, older
+  firmware) is never replaced. The server logs an error, stays inactive and
+  answers `503`. To start over, change `reset_token` (and keep
+  `initial_password` set). The record is wiped once when the configured token
+  differs from the stored one. Remove nothing afterwards: keep the new number.
+  If the token slot was lost too, erase the flash.
+- Records from older firmware (single unsalted SHA-256 key derivation) do not
+  decode and are never misread.
+- **Replay limit.** The activation JWE is encrypted to the admin key but has
+  no nonce or timestamp. Someone who captured it can replay it while the server
+  is inactive and re-activate it. They do not learn any key. A challenge
+  endpoint would fix this but would change the protocol for existing scripts,
+  so it is not done. Keep the management network trusted, or use unattended
+  mode.
 
 Example activation flow:
 
@@ -100,51 +155,78 @@ curl -X POST -H "Content-Type: application/json" -d @request.jwe http://<esp-ip>
 curl http://<esp-ip>/adv
 ```
 
-## ESPHome Notifications
+## HTTP endpoints
 
-The component exposes ESPHome automations so notifications stay opt-in.
+| Endpoint | Password mode | Unattended |
+|---|---|---|
+| `GET /adv`, `GET /adv/<thp>` | 403 while inactive | signed advertisement |
+| `POST /rec/<kid>` | 403 while inactive | recovery |
+| `GET /pub` | admin public key JWK | 404 |
+| `POST /activate` | activate (JWE body) | 404 |
+| `POST /deactivate` | deactivate (JWE body, password proof) | 404 |
 
-```yaml
-api:
+Request bodies are capped at 4096 bytes. On ESP-IDF, ESPHome 2026.8 and later
+deliver POST bodies to `handleBody()`; the component buffers them there. For
+older ESPHome versions the component reads the body from the socket if
+`handleBody()` was never called for that request.
 
-tang_server:
-  id: tang_component
-  initial_password: !secret tang_initial_password
-  key_lifetime: 1h
-  on_request:
-    then:
-      - homeassistant.event:
-          event: esphome.tang_request
-          data:
-            path: !lambda "return path;"
-            method: !lambda "return method;"
-            status: !lambda "return status;"
+## ESPHome notes
+
+- Examples: `esphome-tang/esp32tang.yaml` (password mode),
+  `esphome-tang/esp32tang-unattended.yaml`, and local-component variants
+  `tang_server.yaml` and `tang_server_unattended.yaml`.
+- Copy `esphome-tang/secrets.sample.yaml` to `esphome-tang/secrets.yaml` and
+  replace every value. `secrets.yaml` is git-ignored.
+- Sensors and automations (`on_request`, `on_activate`, ...) run on the ESPHome
+  main loop. The HTTP task only queues events (bounded queue, oldest dropped
+  with a warning).
+- Triggers: `on_request(path, method, status)`, `on_activate(success)`,
+  `on_deactivate()`, `on_recovery(success)`. Entities: `binary_sensor: active`;
+  `sensor: request_count, activation_count, recovery_count, last_status`;
+  `text_sensor: last_path, last_method, last_error`.
+- If the core cannot start, the component logs an error, sets a component
+  error status and every Tang request answers `503`.
+
+Compile the examples with throwaway secrets:
+
+```bash
+docker compose -f esphome-tang/docker-compose.yml run --rm esphome   # password mode
 ```
 
-Available triggers:
+or with Nix: `WORK_ROOT=$PWD nix shell nixpkgs#esphome -c bash esphome-tang/esphome-compile.sh tang_server_unattended.yaml`.
 
-- `on_request(path, method, status)`
-- `on_activate(success)`
-- `on_deactivate()`
-- `on_recovery(success)`
+## Tests
 
-Optional ESPHome entities are also available for status dashboards:
+```bash
+make test           # host tests: core, crypto vectors, jose, real Clevis round trip
+make test-esphome   # ESPHome config validation (seed rules, mode rules)
+```
 
-- `binary_sensor`: `active`
-- `sensor`: `request_count`, `activation_count`, `recovery_count`, `last_status`
-- `text_sensor`: `last_path`, `last_method`, `last_error`
+`make test` runs `tests/run.sh`. It needs cmake, a C++17 compiler, mbedTLS 3.x,
+`jose`, `clevis` and `curl`. If a tool is missing and `nix` exists, the script
+re-runs itself in `nix shell`. It never skips: a missing tool is an error. Set
+`MBEDTLS_PREFIX` to use a non-Nix mbedTLS. `ctest` also works in
+`build-tests/` after a run.
 
-## Protocol Limits
+What is covered: seed derivation (deterministic, distinct, pinned known
+answers), HKDF and PBKDF2 vectors, SHA-1 and SHA-256 thumbprints against
+`jose jwk thp`, `/adv` JWS verified by `jose jws ver`, ECMR recovery against an
+independent `jose jwk exc`, invalid client points, deactivate with a wrong
+password, corrupt and foreign records, reset token, body buffer reset, and
+Clevis encrypt/decrypt through `tests/tang_shim.cpp` (same seed after restart,
+`old_seeds` rotation).
 
-This is not yet a finished security product.
+## Standalone build
 
-- Live ESP32 curl smoke tests still need hardware and an activation JWE.
-- Live Clevis bind/recover tests still need a reachable ESP32.
-- Signed advertisement work currently needs a maintained key model decision for
-  admin-key reuse versus a dedicated signing key.
-- Tang key rotation is tracked separately.
-- Password-derived local encryption remains a development design until the KDF
-  and storage model are hardened.
+```bash
+make build
+```
+
+The standalone firmware owns its Wi-Fi setup, serial `NUKE` wipe, Arduino
+`WebServer` and `/reboot`. It runs password mode only. Its EEPROM layout
+changed with this version: an old EEPROM image is reported as an unrecognized
+record and not used. Wipe it with `NUKE` on the serial console to start over.
+The standalone sources were updated but not compiled in this change.
 
 ## References
 
