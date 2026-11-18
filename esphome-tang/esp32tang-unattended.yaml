@@ -1,0 +1,76 @@
+# Unattended mode: the Tang keys are derived from `seed` at every boot. The
+# server is active as soon as it has network, with no activation step, so a
+# NixOS LUKS disk can unlock after a power outage with nobody present.
+#
+# READ THE THREAT MODEL IN README.md FIRST. The seed is inside the firmware
+# image. Enable ESP32 flash encryption and secure boot, and use a different
+# seed for every device.
+substitutions:
+  device_name: esp32-tang-1
+  friendly_name: ESP32 Tang 1
+  tang_source: github://bogorad/esp32-tang@main
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: m5stack-atom
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+  # The default reboots the device after 15 min without a Home Assistant
+  # connection. Unlock must keep working without Home Assistant.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+
+external_components:
+  - source: ${tang_source}
+    components: [tang_server]
+    refresh: always
+
+tang_server:
+  id: tang_component
+  unattended: true
+  seed: !secret tang_seed
+  # Rotation (see README): keep the previous seed so old Clevis bindings still
+  # unlock, then re-bind and drop it.
+  # old_seeds:
+  #   - !secret tang_old_seed
+
+binary_sensor:
+  - platform: tang_server
+    tang_server_id: tang_component
+    active:
+      name: "Tang Active"
+
+sensor:
+  - platform: tang_server
+    tang_server_id: tang_component
+    request_count:
+      name: "Tang Request Count"
+    recovery_count:
+      name: "Tang Recovery Count"
+    last_status:
+      name: "Tang Last Status"

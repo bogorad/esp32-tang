@@ -2,8 +2,10 @@
 
 WORK_ROOT="${WORK_ROOT:-/work}"
 BUILD_ROOT="${BUILD_ROOT:-/tmp/esp32-tang-esphome}"
+# Usage: esphome-compile.sh [tang_server.yaml|tang_server_unattended.yaml]
+CONFIG_NAME="${1:-tang_server.yaml}"
 CONFIG_DIR="${BUILD_ROOT}/esphome-tang"
-CONFIG_FILE="${CONFIG_DIR}/tang_server.yaml"
+CONFIG_FILE="${CONFIG_DIR}/${CONFIG_NAME}"
 SECRETS_FILE="${CONFIG_DIR}/secrets.yaml"
 
 fail() {
@@ -11,8 +13,8 @@ fail() {
   exit 1
 }
 
-if [ ! -f "${WORK_ROOT}/esphome-tang/tang_server.yaml" ]; then
-  fail "missing ${WORK_ROOT}/esphome-tang/tang_server.yaml"
+if [ ! -f "${WORK_ROOT}/esphome-tang/${CONFIG_NAME}" ]; then
+  fail "missing ${WORK_ROOT}/esphome-tang/${CONFIG_NAME}"
 fi
 
 if [ ! -d "${WORK_ROOT}/components" ]; then
@@ -48,7 +50,7 @@ if [ "$?" -ne 0 ]; then
   fail "failed to copy shared Tang sources"
 fi
 
-cp -f "${WORK_ROOT}/esphome-tang/tang_server.yaml" "${CONFIG_FILE}"
+cp -f "${WORK_ROOT}/esphome-tang/${CONFIG_NAME}" "${CONFIG_FILE}"
 if [ "$?" -ne 0 ]; then
   fail "failed to copy ESPHome example config"
 fi
@@ -57,6 +59,8 @@ cat > "${SECRETS_FILE}" <<'SECRETS'
 wifi_ssid: compile-only
 wifi_password: compile-only
 tang_initial_password: compile-only
+# Compile-only seed (not a real secret; never flash it).
+tang_seed: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 SECRETS
 if [ "$?" -ne 0 ]; then
   fail "failed to write compile-only ESPHome secrets"

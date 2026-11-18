@@ -10,9 +10,13 @@ root stays focused on the shared firmware and component source.
 
 ## Files
 
-- `tang_server.yaml`: Minimal local ESPHome example using `../components`.
-- `esp32tang.yaml`: Full ESPHome example using the GitHub external component.
-- `secrets.yaml`: Demo-only ESPHome secrets. Replace these before flashing.
+- `tang_server.yaml`, `tang_server_unattended.yaml`: Minimal local examples
+  using `../components` (password mode, unattended mode).
+- `esp32tang.yaml`: Full password-mode example using the GitHub component.
+- `esp32tang-unattended.yaml`: Full unattended example (seed-derived keys,
+  active at boot). Read the threat model in the root README first.
+- `secrets.sample.yaml`: Placeholders only. Copy it to `secrets.yaml` (which is
+  git-ignored) and replace every value.
 - `docker-compose.yml`: Runs ESPHome in Docker from this directory.
 - `esphome-compile.sh`: Stages the local component and compiles the demo YAML.
 - `tang-init-demo.sh`: Activates a running device and verifies Clevis
@@ -27,7 +31,8 @@ docker compose -f esphome-tang/docker-compose.yml run --rm esphome
 ```
 
 The compose file mounts the repo at `/work` and runs
-`/work/esphome-tang/esphome-compile.sh`. The script copies the local component
+`/work/esphome-tang/esphome-compile.sh` (password-mode example). Pass
+`tang_server_unattended.yaml` as the argument to compile the unattended one. The script copies the local component
 sources into a temporary ESPHome project and writes compile-only secrets there.
 
 ## Live Clevis Demo
@@ -39,9 +44,11 @@ reachable:
 esphome-tang/tang-init-demo.sh http://<esphome-address> 'your-tang-initial-password'
 ```
 
-The password is the `tang_initial_password` used when the device was compiled.
-It is not the ESPHome web password. The script fetches `/pub`, activates the
-Tang server, fetches `/adv/`, then runs a Clevis encrypt/decrypt round trip.
+This script is for password mode. The password is the `tang_initial_password`
+used when the device was compiled; it is not the ESPHome web password. The
+script fetches `/pub`, activates the Tang server, fetches `/adv/`, then runs a
+Clevis encrypt/decrypt round trip. For an unattended device skip activation:
+`clevis encrypt tang '{"url":"http://<esphome-address>"}'` works at once.
 
 Required local commands:
 

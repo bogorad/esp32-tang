@@ -1,4 +1,6 @@
----
+# Password mode: the Tang key is encrypted with tang_initial_password and must
+# be activated (POST /activate) after every boot. For unattended boot use
+# esp32tang-unattended.yaml instead.
 substitutions:
   device_name: esp32-tang
   friendly_name: ESP32 Tang
@@ -18,6 +20,9 @@ logger:
 api:
   encryption:
     key: !secret api_key
+  # The default reboots the device after 15 min without a Home Assistant
+  # connection. A Tang server must keep running without Home Assistant.
+  reboot_timeout: 0s
 
 ota:
   - platform: esphome
@@ -26,9 +31,11 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # Also stop the Wi-Fi watchdog from rebooting the device on a lost network.
+  reboot_timeout: 0s
   ap:
     ssid: "${friendly_name} Fallback"
-    password: "12345678"
+    password: !secret ap_password
 
 captive_portal:
 
@@ -44,6 +51,9 @@ tang_server:
   id: tang_component
   initial_password: !secret tang_initial_password
   key_lifetime: 1h
+  # Change this number (together with initial_password) to wipe the stored
+  # identity once. Leave it alone otherwise.
+  reset_token: 0
   on_request:
     then:
       - homeassistant.event:

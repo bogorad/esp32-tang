@@ -67,3 +67,8 @@ esphome/
 
 # Host tests
 build-tests/
+
+# Local secrets (use esphome-tang/secrets.sample.yaml as the template)
+esphome-tang/secrets.yaml
+secrets.yaml
+__pycache__/
