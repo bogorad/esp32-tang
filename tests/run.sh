@@ -41,7 +41,14 @@ if [ -z "$prefix" ]; then
   exit 1
 fi
 
+# TANG_TEST_SANITIZE=address,undefined (or thread) builds with sanitizers; use a
+# separate TANG_TEST_BUILD_DIR per sanitizer.
+san_flags=""
+if [ -n "${TANG_TEST_SANITIZE:-}" ]; then
+  san_flags="-fsanitize=${TANG_TEST_SANITIZE} -fno-omit-frame-pointer -g"
+fi
+
 cmake -S "$root/tests" -B "$build_dir" -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$prefix" >&2 || exit 1
+  -DCMAKE_CXX_FLAGS="$san_flags" -DCMAKE_PREFIX_PATH="$prefix" >&2 || exit 1
 cmake --build "$build_dir" -j "$(nproc 2>/dev/null || echo 2)" >&2 || exit 1
 exec "$build_dir/tang_tests" "$@"

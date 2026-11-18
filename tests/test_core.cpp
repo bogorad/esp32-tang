@@ -164,11 +164,6 @@ TEST(adv_jws_verifies_with_jose) {
         "jose jws ver -i " + jws + " -k " + sign_key + " -O-", "", &status);
     CHECK_EQ(status, 0);
     CHECK(payload.find("\"keys\"") != std::string::npos);
-    // The payload advertises exactly the signing and the exchange key.
-    int s2 = -1;
-    const std::string thp1 = tt::trim(tt::run_command(
-        "jose fmt -j- -Og keys -Af- 2>/dev/null | head -n 0", payload, &s2));
-    (void)thp1;
     CHECK(payload.find(tt::b64url(k.ex_pub, 32)) != std::string::npos);
     CHECK(payload.find(tt::b64url(k.sign_pub, 32)) != std::string::npos);
 
@@ -375,10 +370,29 @@ TEST(password_mode_activate_recover_expire) {
   CHECK_EQ(e.core.handle_request(tt::make_request("GET", "/adv")).status, 200);
   CHECK_EQ(activate(e, "pw1").status, 400);  // already active
 
-  // /rec works with both thumbprints of the unlocked exchange key.
-  const std::string adv = e.core.handle_request(tt::make_request("GET", "/adv")).body;
-  const std::string payload = adv;  // base64 payload; decode to find exchange key
-  (void)payload;
+  // /rec works with both thumbprints of the unlocked exchange key. The key
+  // is random here, so read it from the advertisement payload.
+  {
+    const std::string adv = e.core.handle_request(tt::make_request("GET", "/adv")).body;
+    const std::string payload_b64 = tt::json_string_field(adv, "payload");
+    REQUIRE(!payload_b64.empty());
+    uint8_t decoded[1024];
+    size_t dlen = 0;
+    REQUIRE(tang::base64_url_decode(payload_b64.c_str(), payload_b64.size(), decoded, sizeof(decoded), &dlen));
+    const std::string payload(reinterpret_cast<char *>(decoded), dlen);
+    // Second key in the set is the exchange key (ECMR).
+    const size_t pos = payload.find("\"alg\":\"ECMR\"");
+    REQUIRE(pos != std::string::npos);
+    const size_t start = payload.rfind("{\"kty\"", pos);
+    REQUIRE(start != std::string::npos);
+    const std::string jwk = payload.substr(start, payload.find("}", pos) - start + 1);
+    const std::string kid256 = tt::json_string_field(jwk, "kid");
+    REQUIRE(!kid256.empty());
+    tang::TangRngContext rng;
+    uint8_t cpub[64], cpriv[32];
+    REQUIRE(tang::generate_ec_keypair(&rng, cpub, cpriv));
+    CHECK_EQ(e.core.handle_request(tt::make_request("POST", "/rec/" + kid256, recovery_request(cpub))).status, 200);
+  }
 
   e.clock.now += lifetime - 1000;
   CHECK(!e.core.loop());
@@ -578,4 +592,22 @@ TEST(password_mode_without_storage_or_password_fails_loudly) {
     CHECK(!e.log.error_lines.empty());
     CHECK_EQ(e.storage.writes, 0);
   }
+}
+
+TEST(missing_record_with_stored_token_is_an_error_not_a_reinit) {
+  Env first;
+  REQUIRE(first.core.setup(password_config("pw", 5)));
+  tt::MockStorage s = first.storage;
+  // Simulate a lost record (for example an NVS read problem reported as empty).
+  s.blob.clear();
+  s.has_blob = false;
+  s.writes = s.wipes = s.token_writes = 0;
+  tt::MockClock clock;
+  tt::MockLogger log;
+  TangServerCore core(&s, &clock, &log);
+  CHECK(!core.setup(password_config("pw", 5)));
+  CHECK_EQ(s.writes, 0);
+  CHECK_EQ(s.wipes, 0);
+  CHECK(!log.error_lines.empty());
+  CHECK_EQ(core.handle_request(tt::make_request("GET", "/pub")).status, 503);
 }

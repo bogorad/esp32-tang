@@ -258,6 +258,10 @@ void send_response(AsyncWebServerRequest *request, const TangResponse &response)
 // Fallback for ESPHome versions that do not deliver request bodies through
 // handleBody(): read the body from the socket. Only used when handleBody()
 // never ran for this request, so the socket has not been consumed.
+// Newer ESPHome (checked: 2026.10.2) calls handleBody() for every content type
+// except application/x-www-form-urlencoded and multipart, and consumes the
+// body itself for those. For form-urlencoded the recv below returns 0, so the
+// request fails fast with the hint above instead of blocking.
 bool read_body_from_socket(AsyncWebServerRequest *request, std::string *body) {
   const size_t total = request->contentLength();
   body->clear();
@@ -372,7 +376,8 @@ void TangHttpHandler::handleRequest(AsyncWebServerRequest *request) {
       } else {
 #ifdef USE_ESP32
         if (!read_body_from_socket(request, &tang_request.body)) {
-          send_text(request, 400, "Bad Request: Failed to read body");
+          send_text(request, 400,
+                    "Bad Request: Failed to read body (send Content-Type: application/json or application/jwk+json, not form-urlencoded)");
           return;
         }
 #else

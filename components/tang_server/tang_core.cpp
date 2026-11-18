@@ -671,7 +671,7 @@ bool TangServerCore::setup_password(const TangConfig &config) {
       config.initial_password != nullptr && config.initial_password[0] != '\0';
 
   uint32_t stored_token = 0;
-  const TangStorageStatus token_status = storage_->read_reset_token(&stored_token);
+  TangStorageStatus token_status = storage_->read_reset_token(&stored_token);
   if (token_status == TangStorageStatus::kError) {
     logger_->error("Cannot read reset token from storage; staying inactive");
     return false;
@@ -701,9 +701,20 @@ bool TangServerCore::setup_password(const TangConfig &config) {
       return false;
     }
     state_status = TangStorageStatus::kEmpty;
+    token_status = TangStorageStatus::kEmpty;  // wipe() cleared it
   }
 
   if (state_status == TangStorageStatus::kEmpty) {
+    if (token_status == TangStorageStatus::kOk) {
+      // A token exists, so this device was initialized before. Empty state now
+      // means lost or unreadable data (e.g. a storage read error), not a first
+      // boot. Never create a new identity silently.
+      logger_->error(
+          "Reset token is stored but the key record is missing; refusing to "
+          "create a new identity. Change reset_token (with initial_password) "
+          "to start over deliberately.");
+      return false;
+    }
     if (!have_password) {
       logger_->error(
           "No stored record and no initial_password; staying inactive");

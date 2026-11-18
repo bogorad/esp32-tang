@@ -165,10 +165,15 @@ curl http://<esp-ip>/adv
 | `POST /activate` | activate (JWE body) | 404 |
 | `POST /deactivate` | deactivate (JWE body, password proof) | 404 |
 
-Request bodies are capped at 4096 bytes. On ESP-IDF, ESPHome 2026.8 and later
-deliver POST bodies to `handleBody()`; the component buffers them there. For
-older ESPHome versions the component reads the body from the socket if
-`handleBody()` was never called for that request.
+Request bodies are capped at 4096 bytes. POST requests must send
+`Content-Type: application/json` or `application/jwk+json` (Clevis and the demo
+script do). On ESP-IDF, current ESPHome (read in the 2026.10.2 source) delivers
+such bodies to `handleBody()` with the same request pointer and chunk index
+starting at 0; the component buffers them there. ESPHome consumes
+`application/x-www-form-urlencoded` bodies itself (for example plain
+`curl -d`), so those get a clear 400. For older ESPHome versions that never call
+`handleBody()` (checked: 2026.5.1) the component reads the body from the
+socket.
 
 ## ESPHome notes
 
