@@ -7,13 +7,37 @@ share one Tang core in `components/tang_server/` (also linked from `src/`):
 - Standalone ESP-IDF/Arduino firmware in `main/` and `standalone/`
   (password mode only; not compiled in this change, see Status).
 
+## What's new (2026-11-18)
+
+- **Unattended mode** with seed-derived keys (HKDF-SHA256): options `seed` and
+  `old_seeds`. The server is active at boot, with no activation and no flash
+  writes.
+- **SHA-1 and SHA-256 key IDs** on `/adv/<thp>` and `/rec/<kid>`. Clevis 17 and
+  later use SHA-256.
+- **Request path normalization**: Clevis URLs with a trailing slash and
+  `//adv` now work.
+- **POST body handling for ESPHome 2026.8 and later** (`handleBody`). Older
+  versions use the socket-read fallback.
+- **Password-mode hardening**: no `GET /deactivate`, password check before
+  any change, PBKDF2 with a random salt, back-off on wrong passwords, a
+  versioned record, no silent re-init of a bad record, and `reset_token`.
+- **Thread safety**: one mutex in the core; ESPHome events go through a queue.
+- **Host test suite** with real Clevis round trips: `make test`.
+- **Example and secrets hygiene**: `secrets.sample.yaml`, no committed secrets.
+
+New to Tang and Clevis, or setting up a device? Read the
+[guide](docs/guide.md): how network-bound unlock works, which mode to pick,
+ESPHome setup step by step, Clevis `sss` binding, LUKS2 header size, NixOS and
+troubleshooting.
+
 ## Status
 
 Experimental. Verified on a host (see Tests): the core against mbedTLS 3.x,
-`jose`, and a real Clevis encrypt/decrypt round trip. The ESPHome component
-compiles with ESPHome 2026.5.1 (both local examples, ESP-IDF and Arduino
-frameworks; ESPHome 2026.8 and later were not compiled). Nothing in this tree
-has been run on ESP32 hardware. Do a live Clevis test on your device before you rely on it.
+`jose`, and a real Clevis encrypt/decrypt round trip. Verified on hardware:
+ESP32-C6 (M5Stack NanoC6) and classic ESP32 (M5Stack Atom), ESPHome 2026.9.1,
+ESP-IDF framework. On the C6 with Bluetooth proxy and web server the app used
+about 87% of a 1.75 MB app partition. The standalone firmware was not rebuilt
+for this release. Do a live Clevis test on your device before you rely on it.
 
 ## Two modes
 
@@ -206,6 +230,9 @@ or with Nix: `WORK_ROOT=$PWD nix shell nixpkgs#esphome -c bash esphome-tang/esph
 make test           # host tests: core, crypto vectors, jose, real Clevis round trip
 make test-esphome   # ESPHome config validation (seed rules, mode rules)
 ```
+
+Sanitizers: `TANG_TEST_SANITIZE=address,undefined TANG_TEST_BUILD_DIR=build-asan make test`.
+More in the [guide](docs/guide.md).
 
 `make test` runs `tests/run.sh`. It needs cmake, a C++17 compiler, mbedTLS 3.x,
 `jose`, `clevis` and `curl`. If a tool is missing and `nix` exists, the script

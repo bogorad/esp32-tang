@@ -72,7 +72,9 @@ The ESPHome adapter owns:
 - ESPHome automations and Home Assistant notification hooks
 
 Both adapters should call the same shared-core operations for `/adv`, `/pub`,
-`/activate`, `/deactivate`, and future recovery work.
+`/activate`, `/deactivate`, and `/rec/<kid>`. Path normalization happens once
+in the core (`normalize_tang_path`), so every adapter routes the same way.
+In unattended mode `/pub`, `/activate` and `/deactivate` do not exist (404).
 
 ## Ownership Notes
 

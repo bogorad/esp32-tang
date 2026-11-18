@@ -4,7 +4,8 @@ This directory contains the ESPHome-facing demo assets for this fork.
 
 Upstream `upstream/main` is the original ESP32 Tang firmware. The current tree
 adds an ESPHome external component, a shared Tang core, signed advertisements,
-`/rec/{kid}` recovery routing, Docker-based ESPHome compilation, and a small
+`/rec/{kid}` recovery routing, an unattended mode (seed-derived keys, no
+activation step), password-mode hardening, Docker-based ESPHome compilation, and a small
 Clevis round-trip demo. Those demo-specific files are kept here so the repo
 root stays focused on the shared firmware and component source.
 
