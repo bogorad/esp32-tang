@@ -15,9 +15,52 @@
 #include <mbedtls/md.h>
 #include <mbedtls/sha1.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/version.h>
+
+// mbedTLS 2.x (for example LibreTiny on rtl87xx) differs from 3.x:
+//  - mbedtls_sha1/sha256_{starts,update,finish} return void in 2.x. Since 2.7
+//    the int-returning variants are named *_ret. Before 2.7 only void exists.
+//  - MBEDTLS_PRIVATE() does not exist in 2.x; the members are public there.
+// Every other mbedTLS call in this file has the same signature in 2.x and 3.x.
+#ifndef MBEDTLS_PRIVATE
+#define MBEDTLS_PRIVATE(member) member
+#endif
 
 namespace tang {
 namespace {
+
+#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+int sha256_starts(mbedtls_sha256_context *ctx) { return mbedtls_sha256_starts(ctx, 0); }
+int sha256_update(mbedtls_sha256_context *ctx, const uint8_t *data, size_t len) {
+  return mbedtls_sha256_update(ctx, data, len);
+}
+int sha256_finish(mbedtls_sha256_context *ctx, uint8_t *digest) { return mbedtls_sha256_finish(ctx, digest); }
+int sha1_digest(const uint8_t *data, size_t len, uint8_t *digest) { return mbedtls_sha1(data, len, digest); }
+#elif MBEDTLS_VERSION_NUMBER >= 0x02070000
+int sha256_starts(mbedtls_sha256_context *ctx) { return mbedtls_sha256_starts_ret(ctx, 0); }
+int sha256_update(mbedtls_sha256_context *ctx, const uint8_t *data, size_t len) {
+  return mbedtls_sha256_update_ret(ctx, data, len);
+}
+int sha256_finish(mbedtls_sha256_context *ctx, uint8_t *digest) { return mbedtls_sha256_finish_ret(ctx, digest); }
+int sha1_digest(const uint8_t *data, size_t len, uint8_t *digest) { return mbedtls_sha1_ret(data, len, digest); }
+#else
+int sha256_starts(mbedtls_sha256_context *ctx) {
+  mbedtls_sha256_starts(ctx, 0);
+  return 0;
+}
+int sha256_update(mbedtls_sha256_context *ctx, const uint8_t *data, size_t len) {
+  mbedtls_sha256_update(ctx, data, len);
+  return 0;
+}
+int sha256_finish(mbedtls_sha256_context *ctx, uint8_t *digest) {
+  mbedtls_sha256_finish(ctx, digest);
+  return 0;
+}
+int sha1_digest(const uint8_t *data, size_t len, uint8_t *digest) {
+  mbedtls_sha1(data, len, digest);
+  return 0;
+}
+#endif
 
 constexpr char kRngPersonalization[] = "esp32_tang_server";
 
@@ -219,12 +262,12 @@ bool sha256_digest(const uint8_t *data, size_t data_len,
   mbedtls_sha256_context sha_ctx;
   mbedtls_sha256_init(&sha_ctx);
 
-  int ret = mbedtls_sha256_starts(&sha_ctx, 0);
+  int ret = sha256_starts(&sha_ctx);
   if (ret == 0 && data_len != 0) {
-    ret = mbedtls_sha256_update(&sha_ctx, data, data_len);
+    ret = sha256_update(&sha_ctx, data, data_len);
   }
   if (ret == 0) {
-    ret = mbedtls_sha256_finish(&sha_ctx, digest);
+    ret = sha256_finish(&sha_ctx, digest);
   }
 
   mbedtls_sha256_free(&sha_ctx);
@@ -441,7 +484,7 @@ bool compute_ec_jwk_thumbprint(const uint8_t pub_key[kEcPublicKeySize],
       // SHA-1 is used only as a key identifier (tangd accepts it). It is not
       // used for signatures or key derivation.
       digest_len = kSha1DigestSize;
-      ok = mbedtls_sha1(data, canonical.size(), digest) == 0;
+      ok = sha1_digest(data, canonical.size(), digest) == 0;
     } else {
       digest_len = kSha256DigestSize;
       ok = sha256_digest(data, canonical.size(), digest);
@@ -519,36 +562,36 @@ bool concat_kdf(uint8_t *output_key, size_t output_key_len_bytes,
   uint8_t digest[kSha256DigestSize];
 
   mbedtls_sha256_init(&sha_ctx);
-  if (mbedtls_sha256_starts(&sha_ctx, 0) != 0) {
+  if (sha256_starts(&sha_ctx) != 0) {
     mbedtls_sha256_free(&sha_ctx);
     return false;
   }
 
   write_be32(round_counter, 1);
-  int ret = mbedtls_sha256_update(&sha_ctx, round_counter, sizeof(round_counter));
+  int ret = sha256_update(&sha_ctx, round_counter, sizeof(round_counter));
   if (ret == 0) {
-    ret = mbedtls_sha256_update(&sha_ctx, shared_secret, shared_secret_len);
+    ret = sha256_update(&sha_ctx, shared_secret, shared_secret_len);
   }
   if (ret == 0) {
     write_be32(field_len_be, alg_id_len);
-    ret = mbedtls_sha256_update(&sha_ctx, field_len_be, sizeof(field_len_be));
+    ret = sha256_update(&sha_ctx, field_len_be, sizeof(field_len_be));
   }
   if (ret == 0) {
-    ret = mbedtls_sha256_update(
+    ret = sha256_update(
         &sha_ctx, reinterpret_cast<const uint8_t *>(alg_id), alg_id_len);
   }
   if (ret == 0) {
-    ret = mbedtls_sha256_update(&sha_ctx, zeros, sizeof(zeros));
+    ret = sha256_update(&sha_ctx, zeros, sizeof(zeros));
   }
   if (ret == 0) {
-    ret = mbedtls_sha256_update(&sha_ctx, zeros, sizeof(zeros));
+    ret = sha256_update(&sha_ctx, zeros, sizeof(zeros));
   }
   if (ret == 0) {
     write_be32(field_len_be, output_key_len_bytes * 8);
-    ret = mbedtls_sha256_update(&sha_ctx, field_len_be, sizeof(field_len_be));
+    ret = sha256_update(&sha_ctx, field_len_be, sizeof(field_len_be));
   }
   if (ret == 0) {
-    ret = mbedtls_sha256_finish(&sha_ctx, digest);
+    ret = sha256_finish(&sha_ctx, digest);
   }
 
   mbedtls_sha256_free(&sha_ctx);
