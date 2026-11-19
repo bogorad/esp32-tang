@@ -74,3 +74,9 @@ sensor:
       name: "Tang Recovery Count"
     last_status:
       name: "Tang Last Status"
+
+text_sensor:
+  - platform: tang_server
+    tang_server_id: tang_component
+    signing_thumbprint:
+      name: "Tang Signing Thumbprint"

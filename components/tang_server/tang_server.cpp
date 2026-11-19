@@ -74,6 +74,17 @@ void TangServerComponent::setup() {
     this->recovery_count_sensor_->publish_state(this->recovery_count_);
   }
 #endif
+#ifdef USE_TEXT_SENSOR
+  // setup() runs on the main loop. The signing key is fixed once the core is
+  // ready (unattended: derived from the seed; password mode: the stored admin
+  // key), so one publish is enough. Not published when the core failed.
+  if (this->signing_thumbprint_text_sensor_ != nullptr) {
+    std::string thumbprint;
+    if (this->handler_->signing_thumbprint(&thumbprint)) {
+      this->signing_thumbprint_text_sensor_->publish_state(thumbprint);
+    }
+  }
+#endif
 }
 
 void TangServerComponent::loop() {
@@ -146,6 +157,10 @@ void TangServerComponent::set_last_method_text_sensor(text_sensor::TextSensor *s
 }
 
 void TangServerComponent::set_last_error_text_sensor(text_sensor::TextSensor *sensor) { this->last_error_text_sensor_ = sensor; }
+
+void TangServerComponent::set_signing_thumbprint_text_sensor(text_sensor::TextSensor *sensor) {
+  this->signing_thumbprint_text_sensor_ = sensor;
+}
 
 bool TangServerComponent::unattended() const { return this->unattended_; }
 const std::string &TangServerComponent::seed() const { return this->seed_; }

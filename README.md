@@ -212,7 +212,13 @@ socket.
 - Triggers: `on_request(path, method, status)`, `on_activate(success)`,
   `on_deactivate()`, `on_recovery(success)`. Entities: `binary_sensor: active`;
   `sensor: request_count, activation_count, recovery_count, last_status`;
-  `text_sensor: last_path, last_method, last_error`.
+  `text_sensor: last_path, last_method, last_error, signing_thumbprint`.
+- `signing_thumbprint` (diagnostic category) is the RFC 7638 SHA-256 thumbprint
+  of the signing key that `/adv` advertises, base64url without padding. It
+  is the value to pass as `thp` in a Clevis binding (`clevis encrypt tang`
+  `'{"url":"...","thp":"<value>"}'`). It is published from the main loop.
+  It is set at boot in both modes: the key exists from boot in unattended mode,
+  and password mode creates or loads the admin key during setup.
 - If the core cannot start, the component logs an error, sets a component
   error status and every Tang request answers `503`.
 

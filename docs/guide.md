@@ -138,6 +138,13 @@ Details of the key derivation, rotation and record handling are in the
 
    It should print `test`.
 
+   Optional: add the `signing_thumbprint` text sensor (see the examples). It
+   shows the thumbprint of the signing key in Home Assistant, under
+   Diagnostic. Use that value as `thp` in `clevis encrypt tang` to skip the
+   trust prompt, and compare it with `curl -s http://tang1.lan/adv | jose fmt
+   -j- -g payload -u- | jose b64 dec -i- -O- | jose fmt -j- -g keys -g 0 -o- |
+   jose jwk thp -i-`.
+
 Complete examples: `esphome-tang/esp32tang-unattended.yaml` and
 `esphome-tang/tang_server_unattended.yaml`.
 

@@ -106,3 +106,5 @@ text_sensor:
       name: "Tang Last Method"
     last_error:
       name: "Tang Last Error"
+    signing_thumbprint:
+      name: "Tang Signing Thumbprint"

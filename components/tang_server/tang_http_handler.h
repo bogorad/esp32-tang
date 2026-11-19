@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 #include "esphome/components/web_server_base/web_server_base.h"
@@ -23,6 +24,8 @@ class TangHttpHandler : public AsyncWebHandler {
   bool loop();
   bool ready() const;
   bool active() const;
+  // False when the core is not ready.
+  bool signing_thumbprint(std::string *out) const;
 
   bool canHandle(AsyncWebServerRequest *request) const override;
   void handleRequest(AsyncWebServerRequest *request) override;

@@ -907,6 +907,21 @@ bool TangServerCore::is_unattended() const {
   return unattended_;
 }
 
+bool TangServerCore::signing_thumbprint(std::string *out) const {
+  if (out == nullptr) {
+    return false;
+  }
+  uint8_t pub[tang::kEcPublicKeySize];
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!ready_) {
+      return false;
+    }
+    std::memcpy(pub, signing_.pub, sizeof(pub));
+  }
+  return compute_key_id(pub, tang::ThumbprintHash::kSha256, out);
+}
+
 TangResponse TangServerCore::handle_adv(const std::string &path) {
   std::string thp;
   // `path` is normalized: "/adv" or "/adv/<thp>".

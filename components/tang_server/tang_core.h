@@ -50,6 +50,10 @@ class TangServerCore {
   bool is_active() const;
   bool is_ready() const;
   bool is_unattended() const;
+  // RFC 7638 SHA-256 thumbprint (base64url, no padding) of the signing key
+  // that /adv advertises. False until setup() succeeded. In unattended mode
+  // the key exists from boot; in password mode it is the admin key.
+  bool signing_thumbprint(std::string *out) const;
 
  private:
   struct KeyPair {

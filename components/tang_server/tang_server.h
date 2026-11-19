@@ -45,6 +45,7 @@ class TangServerComponent : public Component {
   void set_last_path_text_sensor(text_sensor::TextSensor *sensor);
   void set_last_method_text_sensor(text_sensor::TextSensor *sensor);
   void set_last_error_text_sensor(text_sensor::TextSensor *sensor);
+  void set_signing_thumbprint_text_sensor(text_sensor::TextSensor *sensor);
 
   bool unattended() const;
   const std::string &seed() const;
@@ -104,6 +105,7 @@ class TangServerComponent : public Component {
   text_sensor::TextSensor *last_path_text_sensor_{nullptr};
   text_sensor::TextSensor *last_method_text_sensor_{nullptr};
   text_sensor::TextSensor *last_error_text_sensor_{nullptr};
+  text_sensor::TextSensor *signing_thumbprint_text_sensor_{nullptr};
   CallbackManager<void(std::string, std::string, int)> request_callback_;
   CallbackManager<void(bool)> activate_callback_;
   CallbackManager<void()> deactivate_callback_;

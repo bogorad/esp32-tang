@@ -34,3 +34,9 @@ tang_server:
   id: tang_component
   unattended: true
   seed: !secret tang_seed
+
+text_sensor:
+  - platform: tang_server
+    tang_server_id: tang_component
+    signing_thumbprint:
+      name: "Tang Signing Thumbprint"

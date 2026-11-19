@@ -28,9 +28,9 @@ wifi_ssid: "test"
 wifi_password: "testtesttest"
 SECRETS
 
-# case <name> <expect: ok|fail> <expected-message-fragment> <tang_server yaml body>
+# case <name> <expect: ok|fail> <expected-message-fragment> <tang_server yaml body> [extra top-level yaml]
 case_run() {
-  local name="$1" expect="$2" fragment="$3" body="$4"
+  local name="$1" expect="$2" fragment="$3" body="$4" extra="${5:-}"
   local dir="$work/$name"
   mkdir -p "$dir" || return 1
   cp "$work/secrets.yaml" "$dir/secrets.yaml"
@@ -52,6 +52,7 @@ external_components:
     components: [tang_server]
 tang_server:
 $body
+$extra
 YAML
   local out status
   out="$(cd "$dir" && esphome config c.yaml 2>&1)"
@@ -110,5 +111,18 @@ case_run old_seed_duplicates fail "duplicate or the current seed" "  unattended:
     - \"$other_seed\"
     - \"$other_seed\""
 
+case_run signing_thumbprint_unattended_ok ok "" "  id: tang_component
+  unattended: true
+  seed: \"$good_seed\"" "text_sensor:
+  - platform: tang_server
+    tang_server_id: tang_component
+    signing_thumbprint:
+      name: \"Tang Signing Thumbprint\""
+case_run signing_thumbprint_password_ok ok "" "  id: tang_component
+  initial_password: \"correct horse\"" "text_sensor:
+  - platform: tang_server
+    tang_server_id: tang_component
+    signing_thumbprint:
+      name: \"Tang Signing Thumbprint\""
 echo "$((pass + fail)) config cases, $fail failed"
 [ "$fail" -eq 0 ]

@@ -316,6 +316,10 @@ bool TangHttpHandler::ready() const { return core_context_ != nullptr && core_co
 
 bool TangHttpHandler::active() const { return ready() && core_context_->core.is_active(); }
 
+bool TangHttpHandler::signing_thumbprint(std::string *out) const {
+  return ready() && core_context_->core.signing_thumbprint(out);
+}
+
 bool TangHttpHandler::loop() { return ready() && core_context_->core.loop(); }
 
 bool TangHttpHandler::canHandle(AsyncWebServerRequest *request) const { return is_tang_path(request_path(request)); }

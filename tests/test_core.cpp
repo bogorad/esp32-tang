@@ -672,3 +672,90 @@ TEST(core_routes_clevis_style_paths_like_plain_paths) {
     CHECK_EQ(e.core.handle_request(tt::make_request("POST", path, "x")).status, 404);
   }
 }
+
+// ------------------------------------------------- signing_thumbprint sensor
+namespace {
+
+// Thumbprint of the signing JWK that /adv advertises, computed by jose from
+// the advertisement payload (independent of our own code). The signature is
+// verified by other tests.
+std::string jose_thumbprint_of_advertised_signing_key(TangServerCore &core) {
+  tt::TempFiles files;
+  const TangResponse adv = core.handle_request(tt::make_request("GET", "/adv"));
+  if (adv.status != 200) return "";
+  int status = -1;
+  const std::string b64 = tt::run_command(
+      "jose fmt -j " + files.write(adv.body) + " -g payload -u-", "", &status);
+  if (status != 0) return "";
+  const std::string payload = tt::run_command("jose b64 dec -i- -O-", b64, &status);
+  if (status != 0) return "";
+  const std::string jwk = tt::run_command(
+      "jose fmt -j " + files.write(payload) + " -g keys -g 0 -o-", "", &status);
+  if (status != 0) return "";
+  return tt::run_command("jose jwk thp -a S256 -i " + files.write(jwk), "", &status);
+}
+
+}  // namespace
+
+TEST(signing_thumbprint_unattended_matches_jose_and_known_answer) {
+  REQUIRE(tt::have_tool("jose"));
+  Env e;
+  std::string thp;
+  CHECK(!e.core.signing_thumbprint(&thp));  // not ready before setup
+  REQUIRE(e.core.setup(unattended_config(tt::seed_a())));
+  REQUIRE(e.core.signing_thumbprint(&thp));
+  // Known answer: the same value the /adv/<thp> test above pins for seed A.
+  CHECK_EQ(thp, std::string("V-UCOWj-XdflqBPu-vZHIhZlJ6eThQ2pWHCo-nu5oPI"));
+  CHECK_EQ(thp.size(), 43u);
+  CHECK(thp.find_first_of("+/=") == std::string::npos);  // base64url, no padding
+
+  // Independent: jose over the advertised signing JWK. Needs the unattended
+  // core to be active from boot (no activation step).
+  CHECK_EQ(thp, jose_thumbprint_of_advertised_signing_key(e.core));
+
+  // Independent: jose over the public JWK built from the derived key.
+  tt::DerivedKeys k;
+  REQUIRE(tt::derive_keys(tt::seed_a(), &k));
+  tt::TempFiles files;
+  int status = -1;
+  CHECK_EQ(thp, tt::run_command("jose jwk thp -a S256 -i " +
+                                    files.write(tt::public_jwk_json(k.sign_pub)),
+                                "", &status));
+  CHECK_EQ(status, 0);
+  // /adv/<thp> accepts the value, so it is the id Clevis would use.
+  CHECK_EQ(e.core.handle_request(tt::make_request("GET", "/adv/" + thp)).status, 200);
+
+  // Same seed, same value; a different seed gives a different value.
+  Env same;
+  REQUIRE(same.core.setup(unattended_config(tt::seed_a())));
+  std::string again;
+  REQUIRE(same.core.signing_thumbprint(&again));
+  CHECK_EQ(thp, again);
+  Env other;
+  REQUIRE(other.core.setup(unattended_config(tt::seed_b())));
+  std::string different;
+  REQUIRE(other.core.signing_thumbprint(&different));
+  CHECK(thp != different);
+  CHECK(!e.core.signing_thumbprint(nullptr));
+}
+
+TEST(signing_thumbprint_password_mode_is_stable_across_activation_and_reboot) {
+  REQUIRE(tt::have_tool("jose"));
+  Env e;
+  REQUIRE(e.core.setup(password_config("pw1")));
+  std::string before;
+  REQUIRE(e.core.signing_thumbprint(&before));  // available while inactive
+  CHECK_EQ(before.size(), 43u);
+  REQUIRE(activate(e, "pw1").status == 200);
+  std::string after;
+  REQUIRE(e.core.signing_thumbprint(&after));
+  CHECK_EQ(before, after);
+  CHECK_EQ(after, jose_thumbprint_of_advertised_signing_key(e.core));
+
+  // Reboot with the same storage keeps the identity.
+  TangServerCore rebooted(&e.storage, &e.clock, &e.log);
+  REQUIRE(rebooted.setup(password_config("pw1")));
+  std::string again;
+  REQUIRE(rebooted.signing_thumbprint(&again));
+  CHECK_EQ(before, again);
+}
