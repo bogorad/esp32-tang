@@ -1,6 +1,7 @@
 #include "tang_server.h"
 
 #include "esphome/core/log.h"
+#include "esphome/core/version.h"
 #include "tang_http_handler.h"
 
 #ifdef USE_BINARY_SENSOR
@@ -49,7 +50,18 @@ void TangServerComponent::setup() {
 
   // Register the handler even when the core failed: requests then get a clear
   // 503 instead of an unexplained connection failure.
+  // Clevis and tang clients cannot send HTTP credentials, so the handler must
+  // bypass web_server auth. ESPHome 2026.3.0 added add_handler_without_auth().
+  // Older versions only have add_handler(), which applies web_server auth.
+#ifndef ESPHOME_VERSION_CODE
+#error "ESPHOME_VERSION_CODE is not defined; cannot choose how to register the Tang handler"
+#endif
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 3, 0)
+  web_server_base::global_web_server_base->add_handler_without_auth(this->handler_);
+#else
+  ESP_LOGW(TAG, "ESPHome before 2026.3.0: web_server auth also applies to the Tang endpoints");
   web_server_base::global_web_server_base->add_handler(this->handler_);
+#endif
 
   if (!this->handler_->ready()) {
     ESP_LOGE(TAG, "Tang core failed to start (see errors above); every request answers 503");

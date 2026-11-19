@@ -233,7 +233,8 @@ make test-esphome   # ESPHome config validation (needs esphome)
 | Symptom | Meaning and fix |
 |---|---|
 | `403` on `/adv` or `/rec/<kid>` | Password mode and the server is inactive. Activate it, or use unattended mode. |
-| `404` on `/pub`, `/activate`, `/deactivate` | Unattended mode has no such endpoints. |
+| `404` on `/pub`, `/activate`, `/deactivate` | Unattended mode has no such endpoints. The admin endpoints exist only in password mode. |
+| `401` on `/adv` or `/rec/<kid>` | `web_server` has `auth:` and ESPHome is older than 2026.3.0. Clevis cannot send credentials. Use ESPHome 2026.3.0 or later: the component then registers the Tang endpoints without `web_server` auth (`add_handler_without_auth()`). Restrict access to the device at the network level instead. |
 | `404` on `/adv/<thp>` | The thumbprint is not a key of this server (wrong or rotated key). `404` on `/rec/<kid>`: the key id is not active. Re-bind with `clevis luks regen`. |
 | `405` | Wrong HTTP method (for example `GET /deactivate`). |
 | `503` | The core did not start. Read the device log. In password mode this includes a stored record that fails validation; see `reset_token` in the README. |

@@ -199,6 +199,31 @@ starting at 0; the component buffers them there. ESPHome consumes
 `handleBody()` (checked: 2026.5.1) the component reads the body from the
 socket.
 
+### Authentication and `web_server`
+
+The Tang endpoints bypass `web_server` authentication on purpose. Clevis and
+other Tang clients send plain `GET /adv` and `POST /rec/<kid>` requests. They
+cannot send HTTP Basic or Digest credentials, so with `web_server: auth:` set
+on the same server every unlock would fail with `401`. The component registers
+its handler with `add_handler_without_auth()` for this reason. That method
+exists since ESPHome 2026.3.0 (checked in the 2026.3.0, 2026.5.1, 2026.9.1
+and 2026.10.2 sources). On older ESPHome the component falls back to
+`add_handler()`, logs a warning, and `web_server` auth then also covers the
+Tang paths. Use ESPHome 2026.3.0 or later with `web_server` auth.
+
+`web_server` auth still protects the other ESPHome web pages. It does not
+protect these paths:
+
+- `/adv` and `/rec`: open on purpose, as in `tangd`. They give out the
+  public advertisement and the recovery exchange. The recovery reply is only
+  useful to a client that holds the matching Clevis binding.
+- `/pub`, `/activate`, `/deactivate` (password mode): the admin endpoints.
+  They are open at the HTTP layer; the password proof in the JWE body is the
+  access control, with back-off on wrong passwords.
+- In unattended mode the admin endpoints do not exist: they answer `404`.
+
+So restrict who can reach the device at the network level (VLAN, firewall).
+
 ## ESPHome notes
 
 - Examples: `esphome-tang/esp32tang.yaml` (password mode),
