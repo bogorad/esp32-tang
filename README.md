@@ -7,6 +7,18 @@ share one Tang core in `components/tang_server/` (also linked from `src/`):
 - Standalone ESP-IDF/Arduino firmware in `main/` and `standalone/`
   (password mode only; not compiled in this change, see Status).
 
+## What's new (2026-11-19)
+
+- **`signing_thumbprint` text sensor** (diagnostic): the SHA-256 thumbprint of
+  the signing key, for Clevis bindings. Works in both modes.
+- **Tang endpoints bypass `web_server` auth** (ESPHome 2026.3.0 or later), so
+  Clevis can unlock when `web_server: auth:` is set. See
+  [Authentication and `web_server`](#authentication-and-web_server).
+- **mbedTLS 2.x build fix** (for LibreTiny, rtl87xx): the crypto code builds
+  with mbedTLS 2.x and 3.x, and the host tests pass on both. rtl87xx is still
+  not supported: the firmware build stops at `std::mutex`, which the
+  LibreTiny ARM toolchain does not provide.
+
 ## What's new (2026-11-18)
 
 - **Unattended mode** with seed-derived keys (HKDF-SHA256): options `seed` and
